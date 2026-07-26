@@ -306,6 +306,3 @@ func GetLogs(count string, level string) []string {
 }
 
 
-func main(){
-
-}

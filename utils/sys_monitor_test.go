@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"fmt"
 	"os"
 	"testing"
 )
@@ -29,7 +30,7 @@ func TestListProcesses(t *testing.T) {
 
 func TestListProcesses_Filtering(t *testing.T) {
 	pid := os.Getpid()
-	list, err := ListProcesses(string(pid), "pid", 1)
+	list, err := ListProcesses(fmt.Sprintf("%d", pid), "pid", 1)
 	if err != nil {
 		t.Fatalf("failed to list processes: %v", err)
 	}
