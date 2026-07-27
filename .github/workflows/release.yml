@@ -1,0 +1,101 @@
+name: Build and Release MyMCP Server
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Publish as pre-release'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Run Tests
+        run: go test -v ./utils
+
+  build-and-release:
+    name: Cross-Compile and Publish Release
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Get Version Tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          if [ "$VERSION" = "$GITHUB_REF" ]; then
+            VERSION="v0.1.0-test"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Tag version is $VERSION"
+
+      - name: Build Binaries
+        run: |
+          mkdir -p build dist
+          
+          # Linux amd64
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o build/mymcp-linux-amd64 .
+          tar -czvf dist/mymcp-linux-amd64-${{ env.VERSION }}.tar.gz -C build mymcp-linux-amd64
+          
+          # Linux arm64
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o build/mymcp-linux-arm64 .
+          tar -czvf dist/mymcp-linux-arm64-${{ env.VERSION }}.tar.gz -C build mymcp-linux-arm64
+          
+          # Windows amd64
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o build/mymcp-windows-amd64.exe .
+          zip -j dist/mymcp-windows-amd64-${{ env.VERSION }}.zip build/mymcp-windows-amd64.exe
+          
+          # macOS amd64
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o build/mymcp-darwin-amd64 .
+          tar -czvf dist/mymcp-darwin-amd64-${{ env.VERSION }}.tar.gz -C build mymcp-darwin-amd64
+          
+          # macOS arm64 (Apple Silicon)
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o build/mymcp-darwin-arm64 .
+          tar -czvf dist/mymcp-darwin-arm64-${{ env.VERSION }}.tar.gz -C build mymcp-darwin-arm64
+
+      - name: Determine Prerelease Flag
+        id: is_prerelease
+        run: |
+          if [[ "${{ inputs.prerelease }}" == "true" ]] || [[ "${{ env.VERSION }}" == *"-beta"* ]] || [[ "${{ env.VERSION }}" == *"-rc"* ]] || [[ "${{ env.VERSION }}" == *"-alpha"* ]] || [[ "${{ env.VERSION }}" == *"-test"* ]]; then
+            echo "IS_PRERELEASE=true" >> $GITHUB_ENV
+          else
+            echo "IS_PRERELEASE=false" >> $GITHUB_ENV
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: MyMCP Server Release ${{ env.VERSION }}
+          draft: false
+          prerelease: ${{ env.IS_PRERELEASE }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
