@@ -2,7 +2,11 @@ package utils
 
 import (
 	"bufio"
+	"encoding/json"
+	"fmt"
 	"io"
+	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -198,4 +202,82 @@ func FilterEntries(entries []SyslogEntry, filter LogFilter) []SyslogEntry {
 	}
 
 	return result
+}
+
+// WinEventLogEntry represents the JSON structure returned by powershell Get-WinEvent.
+type WinEventLogEntry struct {
+	Timestamp    string `json:"Timestamp"`
+	Id           int    `json:"Id"`
+	Level        int    `json:"Level"`
+	ProviderName string `json:"ProviderName"`
+	Message      string `json:"Message"`
+}
+
+// GetWindowsEventLogs retrieves Windows Event Logs using PowerShell and converts them to SyslogEntry.
+func GetWindowsEventLogs(limit int) ([]SyslogEntry, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	psCmd := fmt.Sprintf(`Get-WinEvent -LogName System -MaxEvents %d | Select-Object @{Name='Timestamp'; Expression={$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')}}, Id, Level, ProviderName, Message | ConvertTo-Json`, limit)
+
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", psCmd)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("powershell failed: %v, output: %s", err, string(out))
+	}
+
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return nil, nil
+	}
+
+	var winEntries []WinEventLogEntry
+	if err := json.Unmarshal([]byte(trimmed), &winEntries); err != nil {
+		var single WinEventLogEntry
+		if err2 := json.Unmarshal([]byte(trimmed), &single); err2 == nil {
+			winEntries = []WinEventLogEntry{single}
+		} else {
+			return nil, fmt.Errorf("failed to unmarshal JSON: %w (original: %v)", err2, err)
+		}
+	}
+
+	var entries []SyslogEntry
+	for _, we := range winEntries {
+		ts := time.Now()
+		if we.Timestamp != "" {
+			if parsedTs, err := time.Parse("2006-01-02 15:04:05", we.Timestamp); err == nil {
+				ts = parsedTs
+			}
+		}
+
+		var sev LogSeverity
+		switch we.Level {
+		case 1:
+			sev = SeverityCritical
+		case 2:
+			sev = SeverityError
+		case 3:
+			sev = SeverityWarning
+		case 4:
+			sev = SeverityInfo
+		case 5:
+			sev = SeverityDebug
+		default:
+			sev = SeverityInfo
+		}
+
+		entry := SyslogEntry{
+			Timestamp: ts,
+			Priority:  we.Level,
+			Severity:  sev,
+			AppName:   we.ProviderName,
+			ProcID:    strconv.Itoa(we.Id),
+			Message:   we.Message,
+			Raw:       fmt.Sprintf("%s [%s] EventID=%d Source=%s: %s", we.Timestamp, sev, we.Id, we.ProviderName, we.Message),
+		}
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
 }

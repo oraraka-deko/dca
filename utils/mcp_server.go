@@ -2,17 +2,33 @@ package utils
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/gogf/gf/v2/frame/g"
 	"github.com/gogf/gf/v2/net/ghttp"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+var windowsBuiltins = map[string]bool{
+	"echo": true, "dir": true, "cd": true, "type": true, "copy": true,
+	"move": true, "del": true, "md": true, "mkdir": true, "rd": true,
+	"rmdir": true, "cls": true, "ver": true, "vol": true, "path": true,
+	"set": true,
+}
+
+var unixBuiltins = map[string]bool{
+	"echo": true, "cd": true, "pwd": true, "alias": true, "export": true,
+	"set": true, "history": true,
+}
 
 // MCPServerWrapper encapsulates the GoFrame HTTP server and mcp-go tools.
 type MCPServerWrapper struct {
@@ -22,6 +38,7 @@ type MCPServerWrapper struct {
 	SandboxManager *VFSSandboxManager
 	TimerChain     *TimerChainManager
 	Hook           *MultiHook
+	FileManager    *FileManager
 	gfServer       *ghttp.Server
 }
 
@@ -36,6 +53,7 @@ func NewMCPServerWrapper(cfg ServerConfig) *MCPServerWrapper {
 	tcm.StartWatchdog(10*time.Second, 10*time.Minute) // Default watchdog safety
 
 	vfsMgr := NewVFSSandboxManager()
+	fm, _ := NewFileManager("")
 
 	mcpSrv := server.NewMCPServer("dca-mcp-server", "1.0.0")
 
@@ -46,6 +64,7 @@ func NewMCPServerWrapper(cfg ServerConfig) *MCPServerWrapper {
 		SandboxManager: vfsMgr,
 		TimerChain:     tcm,
 		Hook:           hook,
+		FileManager:    fm,
 	}
 
 	wrapper.RegisterAllTools()
@@ -54,24 +73,39 @@ func NewMCPServerWrapper(cfg ServerConfig) *MCPServerWrapper {
 
 // RegisterAllTools registers TaskManager, VFS Sandbox, System Monitor, and Git tools with mcp-go.
 func (w *MCPServerWrapper) RegisterAllTools() {
+	// ==========================================
 	// 1. TaskManager Tools
+	// ==========================================
 	w.registerTool("submit_command", "Submit an OS shell or binary command as a background queued task",
 		[]mcp.ToolOption{
 			mcp.WithString("name", mcp.Required(), mcp.Description("Task descriptive name")),
 			mcp.WithString("command", mcp.Required(), mcp.Description("Executable command")),
 			mcp.WithString("args", mcp.Description("Space-separated command arguments")),
+			mcp.WithBoolean("use_shell", mcp.Description("If true, runs command inside default system shell (cmd.exe or /bin/sh)")),
 		},
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			name, _ := req.RequireString("name")
 			command, _ := req.RequireString("command")
 			argsStr := req.GetString("args", "")
+			useShell := req.GetBool("use_shell", false)
+
+			cmdLower := strings.ToLower(strings.TrimSpace(command))
+			if runtime.GOOS == "windows" {
+				if windowsBuiltins[cmdLower] {
+					useShell = true
+				}
+			} else {
+				if unixBuiltins[cmdLower] {
+					useShell = true
+				}
+			}
 
 			var args []string
 			if strings.TrimSpace(argsStr) != "" {
 				args = strings.Fields(argsStr)
 			}
 
-			task, err := w.TaskManager.SubmitCommand(name, command, args...)
+			task, err := w.TaskManager.SubmitCommand(name, useShell, command, args...)
 			if err != nil {
 				return mcp.NewToolResultError("Failed submitting command task: " + err.Error()), nil
 			}
@@ -137,7 +171,9 @@ func (w *MCPServerWrapper) RegisterAllTools() {
 		},
 	)
 
+	// ==========================================
 	// 2. VFS Sandbox Tools
+	// ==========================================
 	w.registerTool("create_sandbox", "Create a new isolated Virtual Filesystem sandbox workspace",
 		[]mcp.ToolOption{
 			mcp.WithString("id", mcp.Required(), mcp.Description("Sandbox identifier")),
@@ -213,7 +249,9 @@ func (w *MCPServerWrapper) RegisterAllTools() {
 		},
 	)
 
+	// ==========================================
 	// 3. System & Monitor Tools
+	// ==========================================
 	w.registerTool("get_system_status", "Retrieve overall system health, CPU, memory, uptime, and IP information",
 		nil,
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -248,6 +286,749 @@ func (w *MCPServerWrapper) RegisterAllTools() {
 				sb.WriteString(fmt.Sprintf("PID: %d | Name: %s | CPU: %.1f%% | Mem: %.1f%%\n", p.PID, p.Name, p.CPUPercent, p.MemoryPercent))
 			}
 			return mcp.NewToolResultText(sb.String()), nil
+		},
+	)
+
+	// ==========================================
+	// 4. File System Manager Tools (Real Disk)
+	// ==========================================
+	w.registerTool("file_manager_list", "List files and directories in current working directory or given path",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Description("Optional path to list. If empty, lists current file manager directory")),
+			mcp.WithBoolean("show_hidden", mcp.Description("Optional. If true, includes hidden files")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path := req.GetString("path", "")
+			showHidden := req.GetBool("show_hidden", false)
+
+			w.FileManager.ShowHidden = showHidden
+			if path != "" {
+				if err := w.FileManager.GoTo(path); err != nil {
+					return mcp.NewToolResultError("Failed to go to path: " + err.Error()), nil
+				}
+			}
+
+			list, err := w.FileManager.List()
+			if err != nil {
+				return mcp.NewToolResultError("Failed to list directory: " + err.Error()), nil
+			}
+
+			data, _ := json.MarshalIndent(list, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	w.registerTool("file_manager_goto", "Change the file manager's active working directory",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute or relative path to navigate to")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path, _ := req.RequireString("path")
+			if err := w.FileManager.GoTo(path); err != nil {
+				return mcp.NewToolResultError("Failed to change directory: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Moved to %s", w.FileManager.CurrentPath)), nil
+		},
+	)
+
+	w.registerTool("file_manager_mkdir", "Create a new directory in the file manager's active working directory",
+		[]mcp.ToolOption{
+			mcp.WithString("name", mcp.Required(), mcp.Description("Directory name")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name, _ := req.RequireString("name")
+			if err := w.FileManager.Mkdir(name); err != nil {
+				return mcp.NewToolResultError("Failed to create directory: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Directory %q created successfully", name)), nil
+		},
+	)
+
+	w.registerTool("file_manager_create_file", "Create a new empty file in the file manager's active working directory",
+		[]mcp.ToolOption{
+			mcp.WithString("name", mcp.Required(), mcp.Description("File name")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name, _ := req.RequireString("name")
+			if err := w.FileManager.CreateFile(name); err != nil {
+				return mcp.NewToolResultError("Failed to create file: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("File %q created successfully", name)), nil
+		},
+	)
+
+	w.registerTool("file_manager_delete", "Delete specified files and directories recursively",
+		[]mcp.ToolOption{
+			mcp.WithString("paths", mcp.Required(), mcp.Description("Comma-separated list of absolute/relative file paths to delete")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			pathsStr, _ := req.RequireString("paths")
+			parts := strings.Split(pathsStr, ",")
+			var list []string
+			for _, p := range parts {
+				trimmed := strings.TrimSpace(p)
+				if trimmed != "" {
+					list = append(list, trimmed)
+				}
+			}
+			if err := w.FileManager.Delete(list); err != nil {
+				return mcp.NewToolResultError("Failed to delete paths: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText("Specified paths deleted successfully"), nil
+		},
+	)
+
+	w.registerTool("file_manager_rename", "Rename a file or folder",
+		[]mcp.ToolOption{
+			mcp.WithString("old_path", mcp.Required(), mcp.Description("Full path to the existing file/folder")),
+			mcp.WithString("new_name", mcp.Required(), mcp.Description("New name for the file/folder")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			oldPath, _ := req.RequireString("old_path")
+			newName, _ := req.RequireString("new_name")
+			if err := w.FileManager.Rename(oldPath, newName); err != nil {
+				return mcp.NewToolResultError("Failed to rename: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText("Renamed successfully"), nil
+		},
+	)
+
+	w.registerTool("file_manager_copy", "Copy specified file/directory paths to clipboard state",
+		[]mcp.ToolOption{
+			mcp.WithString("paths", mcp.Required(), mcp.Description("Comma-separated list of file/directory paths to copy")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			pathsStr, _ := req.RequireString("paths")
+			parts := strings.Split(pathsStr, ",")
+			var list []string
+			for _, p := range parts {
+				trimmed := strings.TrimSpace(p)
+				if trimmed != "" {
+					list = append(list, trimmed)
+				}
+			}
+			w.FileManager.Copy(list)
+			return mcp.NewToolResultText("Paths copied to clipboard state"), nil
+		},
+	)
+
+	w.registerTool("file_manager_cut", "Cut specified file/directory paths to clipboard state",
+		[]mcp.ToolOption{
+			mcp.WithString("paths", mcp.Required(), mcp.Description("Comma-separated list of file/directory paths to cut")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			pathsStr, _ := req.RequireString("paths")
+			parts := strings.Split(pathsStr, ",")
+			var list []string
+			for _, p := range parts {
+				trimmed := strings.TrimSpace(p)
+				if trimmed != "" {
+					list = append(list, trimmed)
+				}
+			}
+			w.FileManager.Cut(list)
+			return mcp.NewToolResultText("Paths cut to clipboard state"), nil
+		},
+	)
+
+	w.registerTool("file_manager_paste", "Paste files from clipboard state to the active working directory",
+		nil,
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if err := w.FileManager.Paste(); err != nil {
+				return mcp.NewToolResultError("Paste failed: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText("Clipboard contents pasted successfully"), nil
+		},
+	)
+
+	w.registerTool("file_manager_search", "Recursively search for files/folders matching a query term",
+		[]mcp.ToolOption{
+			mcp.WithString("query", mcp.Required(), mcp.Description("Search term")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			query, _ := req.RequireString("query")
+			results, err := w.FileManager.Search(query)
+			if err != nil {
+				return mcp.NewToolResultError("Search failed: " + err.Error()), nil
+			}
+			data, _ := json.MarshalIndent(results, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	w.registerTool("file_manager_get_preview", "Get a text preview or metadata description of a file or directory",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Required(), mcp.Description("Path to preview")),
+			mcp.WithNumber("max_lines", mcp.Description("Optional. Max text lines to return (default 100)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path, _ := req.RequireString("path")
+			maxLinesVal := req.GetFloat("max_lines", 100)
+			maxLines := int(maxLinesVal)
+
+			previewType, text, err := w.FileManager.GetPreview(path, maxLines)
+			if err != nil {
+				return mcp.NewToolResultError("Preview failed: " + err.Error()), nil
+			}
+
+			resText := fmt.Sprintf("Type: %s\nContent:\n%s", previewType, text)
+			return mcp.NewToolResultText(resText), nil
+		},
+	)
+
+	w.registerTool("file_manager_bookmarks", "Manage pinned bookmark directory paths",
+		[]mcp.ToolOption{
+			mcp.WithString("action", mcp.Required(), mcp.Description("Action to perform: add, remove, list")),
+			mcp.WithString("path", mcp.Description("Path to add or remove")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			action, _ := req.RequireString("action")
+			path := req.GetString("path", "")
+
+			switch strings.ToLower(action) {
+			case "add":
+				if path == "" {
+					return mcp.NewToolResultError("path is required for add action"), nil
+				}
+				w.FileManager.AddBookmark(path)
+				return mcp.NewToolResultText("Bookmark added"), nil
+			case "remove":
+				if path == "" {
+					return mcp.NewToolResultError("path is required for remove action"), nil
+				}
+				w.FileManager.RemoveBookmark(path)
+				return mcp.NewToolResultText("Bookmark removed"), nil
+			case "list":
+				bookmarks := w.FileManager.GetBookmarks()
+				data, _ := json.MarshalIndent(bookmarks, "", "  ")
+				return mcp.NewToolResultText(string(data)), nil
+			default:
+				return mcp.NewToolResultError("Unsupported action. Choose 'add', 'remove', or 'list'"), nil
+			}
+		},
+	)
+
+	// ==========================================
+	// 5. Git Version Control Tools
+	// ==========================================
+	w.registerTool("git_init", "Initialize a new Git repository",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Required(), mcp.Description("Target directory path")),
+			mcp.WithBoolean("bare", mcp.Description("Optional. Initialize as bare repository")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path, _ := req.RequireString("path")
+			bare := req.GetBool("bare", false)
+			_, err := InitGitManager(path, bare)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to init git: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText("Git repository initialized successfully"), nil
+		},
+	)
+
+	w.registerTool("git_status", "Get compact git status showing staged, modified, and untracked files",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Required(), mcp.Description("Git repository directory path")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path, _ := req.RequireString("path")
+			g, err := NewGitManager(path)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to open git repo: " + err.Error()), nil
+			}
+			status, err := g.GetCompactStatus()
+			if err != nil {
+				return mcp.NewToolResultError("Failed to get status: " + err.Error()), nil
+			}
+			data, _ := json.MarshalIndent(status, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	w.registerTool("git_log", "Get compact git commit log history list",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Required(), mcp.Description("Git repository directory path")),
+			mcp.WithNumber("limit", mcp.Description("Optional. Max commits to return (default 20)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path, _ := req.RequireString("path")
+			limitVal := req.GetFloat("limit", 20)
+			limit := int(limitVal)
+
+			g, err := NewGitManager(path)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to open git repo: " + err.Error()), nil
+			}
+			logs, err := g.GetCompactLog(limit)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to get log: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(strings.Join(logs, "\n")), nil
+		},
+	)
+
+	w.registerTool("git_add", "Stage files in a git repository",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Required(), mcp.Description("Git repository directory path")),
+			mcp.WithString("files", mcp.Required(), mcp.Description("Comma-separated list of relative file paths to stage (use '.' to stage all)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path, _ := req.RequireString("path")
+			filesStr, _ := req.RequireString("files")
+
+			g, err := NewGitManager(path)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to open git repo: " + err.Error()), nil
+			}
+
+			parts := strings.Split(filesStr, ",")
+			var list []string
+			for _, f := range parts {
+				trimmed := strings.TrimSpace(f)
+				if trimmed != "" {
+					list = append(list, trimmed)
+				}
+			}
+
+			if err := g.Add(list...); err != nil {
+				return mcp.NewToolResultError("Failed to add files: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText("Files staged successfully"), nil
+		},
+	)
+
+	w.registerTool("git_commit", "Commit staged changes in a git repository",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Required(), mcp.Description("Git repository directory path")),
+			mcp.WithString("message", mcp.Required(), mcp.Description("Commit message")),
+			mcp.WithString("author", mcp.Description("Optional author name")),
+			mcp.WithString("email", mcp.Description("Optional author email")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path, _ := req.RequireString("path")
+			msg, _ := req.RequireString("message")
+			author := req.GetString("author", "Agent")
+			email := req.GetString("email", "agent@localhost")
+
+			g, err := NewGitManager(path)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to open git repo: " + err.Error()), nil
+			}
+			hash, err := g.Commit(msg, author, email)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to commit: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Committed successfully. Hash: %s", hash.String())), nil
+		},
+	)
+
+	w.registerTool("git_checkout", "Checkout branch or commit hash in a git repository",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Required(), mcp.Description("Git repository directory path")),
+			mcp.WithString("branch", mcp.Required(), mcp.Description("Branch name or commit hash")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path, _ := req.RequireString("path")
+			branch, _ := req.RequireString("branch")
+
+			g, err := NewGitManager(path)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to open git repo: " + err.Error()), nil
+			}
+
+			if err := g.Checkout(branch, nil); err != nil {
+				if len(branch) >= 7 {
+					h := plumbing.NewHash(branch)
+					if errHash := g.CheckoutHash(h); errHash == nil {
+						return mcp.NewToolResultText(fmt.Sprintf("Checked out commit hash %s successfully", branch)), nil
+					}
+				}
+				return mcp.NewToolResultError("Checkout failed: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Checked out branch %s successfully", branch)), nil
+		},
+	)
+
+	w.registerTool("git_branch", "List, create, or delete branches in a git repository",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Required(), mcp.Description("Git repository directory path")),
+			mcp.WithString("action", mcp.Required(), mcp.Description("Action: list, create, delete")),
+			mcp.WithString("name", mcp.Description("Branch name (required for create/delete)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path, _ := req.RequireString("path")
+			action, _ := req.RequireString("action")
+			name := req.GetString("name", "")
+
+			g, err := NewGitManager(path)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to open git repo: " + err.Error()), nil
+			}
+
+			switch strings.ToLower(action) {
+			case "list":
+				branches, err := g.Branches()
+				if err != nil {
+					return mcp.NewToolResultError("Failed to list branches: " + err.Error()), nil
+				}
+				var list []string
+				for _, ref := range branches {
+					list = append(list, ref.Name().Short())
+				}
+				return mcp.NewToolResultText(strings.Join(list, "\n")), nil
+			case "create":
+				if name == "" {
+					return mcp.NewToolResultError("name is required to create a branch"), nil
+				}
+				if err := g.CreateBranch(name); err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+				return mcp.NewToolResultText(fmt.Sprintf("Branch %q created successfully", name)), nil
+			case "delete":
+				if name == "" {
+					return mcp.NewToolResultError("name is required to delete a branch"), nil
+				}
+				if err := g.DeleteBranch(name); err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+				return mcp.NewToolResultText(fmt.Sprintf("Branch %q deleted successfully", name)), nil
+			default:
+				return mcp.NewToolResultError("Unsupported action. Use 'list', 'create', or 'delete'"), nil
+			}
+		},
+	)
+
+	w.registerTool("git_checkpoint", "Stage all changes and commit a checkpoint snapshot for history backup",
+		[]mcp.ToolOption{
+			mcp.WithString("path", mcp.Required(), mcp.Description("Git repository directory path")),
+			mcp.WithString("label", mcp.Description("Optional checkpoint label")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path, _ := req.RequireString("path")
+			label := req.GetString("label", "")
+
+			g, err := NewGitManager(path)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to open git repo: " + err.Error()), nil
+			}
+			hash, err := g.CreateGitCheckpoint(label)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to create checkpoint: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Checkpoint created successfully. Commit Hash: %s", hash)), nil
+		},
+	)
+
+	// ==========================================
+	// 6. System Process & Service Tools
+	// ==========================================
+	w.registerTool("kill_process", "Kill/terminate a system process by PID",
+		[]mcp.ToolOption{
+			mcp.WithNumber("pid", mcp.Required(), mcp.Description("Process PID")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			pidVal, _ := req.RequireFloat("pid")
+			pid := int32(pidVal)
+			if err := KillProcess(pid); err != nil {
+				return mcp.NewToolResultError("Failed to kill process: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Process %d killed successfully", pid)), nil
+		},
+	)
+
+	w.registerTool("signal_process", "Send control signals to a process (kill, terminate, suspend, resume)",
+		[]mcp.ToolOption{
+			mcp.WithNumber("pid", mcp.Required(), mcp.Description("Process PID")),
+			mcp.WithString("signal", mcp.Required(), mcp.Description("Signal action: kill, terminate, suspend, resume")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			pidVal, _ := req.RequireFloat("pid")
+			pid := int32(pidVal)
+			sig, _ := req.RequireString("signal")
+			if err := SignalProcess(pid, sig); err != nil {
+				return mcp.NewToolResultError("Failed sending signal to process: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Signal %q sent to process %d successfully", sig, pid)), nil
+		},
+	)
+
+	w.registerTool("list_services", "List system services (Windows sc or Linux systemd)",
+		[]mcp.ToolOption{
+			mcp.WithString("query", mcp.Description("Optional filter query")),
+			mcp.WithNumber("limit", mcp.Description("Optional limit on return items (default 100)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			query := req.GetString("query", "")
+			limitVal := req.GetFloat("limit", 100)
+			limit := int(limitVal)
+
+			services, err := ListServices(query, limit)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to list services: " + err.Error()), nil
+			}
+			data, _ := json.MarshalIndent(services, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	w.registerTool("manage_service", "Start or stop a system service (Windows sc or Linux systemctl)",
+		[]mcp.ToolOption{
+			mcp.WithString("name", mcp.Required(), mcp.Description("Service name")),
+			mcp.WithString("action", mcp.Required(), mcp.Description("Action: start, stop")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name, _ := req.RequireString("name")
+			action, _ := req.RequireString("action")
+			if err := ManageService(name, action); err != nil {
+				return mcp.NewToolResultError("Service management failed: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Service %q command %q completed successfully", name, action)), nil
+		},
+	)
+
+	w.registerTool("create_service", "Register a new background system service on the host",
+		[]mcp.ToolOption{
+			mcp.WithString("name", mcp.Required(), mcp.Description("Service name")),
+			mcp.WithString("display_name", mcp.Required(), mcp.Description("Service display name description")),
+			mcp.WithString("bin_path", mcp.Required(), mcp.Description("Binary executable path")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name, _ := req.RequireString("name")
+			displayName, _ := req.RequireString("display_name")
+			binPath, _ := req.RequireString("bin_path")
+			if err := CreateService(name, displayName, binPath); err != nil {
+				return mcp.NewToolResultError("Failed to create service: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Service %q registered successfully", name)), nil
+		},
+	)
+
+	w.registerTool("list_scheduled_tasks", "List system scheduled tasks (Windows Task Scheduler or Linux crontab)",
+		[]mcp.ToolOption{
+			mcp.WithString("query", mcp.Description("Optional search filter query")),
+			mcp.WithNumber("limit", mcp.Description("Optional limit on returned items (default 100)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			query := req.GetString("query", "")
+			limitVal := req.GetFloat("limit", 100)
+			limit := int(limitVal)
+
+			tasks, err := ListScheduledTasks(query, limit)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to list scheduled tasks: " + err.Error()), nil
+			}
+			data, _ := json.MarshalIndent(tasks, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	w.registerTool("create_scheduled_task", "Create/schedule a new cron job or Windows scheduled task",
+		[]mcp.ToolOption{
+			mcp.WithString("name", mcp.Required(), mcp.Description("Task descriptor name")),
+			mcp.WithString("task_run", mcp.Required(), mcp.Description("Executable/command path to run")),
+			mcp.WithString("schedule", mcp.Required(), mcp.Description("Cron format schedule (Linux, e.g. '0 5 * * *') or Windows frequency (minute, hourly, daily)")),
+			mcp.WithString("start_time", mcp.Description("Optional start time (Windows, e.g. 'HH:MM')")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name, _ := req.RequireString("name")
+			taskRun, _ := req.RequireString("task_run")
+			schedule, _ := req.RequireString("schedule")
+			startTime := req.GetString("start_time", "")
+
+			if err := CreateScheduledTask(name, taskRun, schedule, startTime); err != nil {
+				return mcp.NewToolResultError("Failed creating scheduled task: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Scheduled task %q created successfully", name)), nil
+		},
+	)
+
+	w.registerTool("delete_scheduled_task", "Delete a cron job or scheduled task by name",
+		[]mcp.ToolOption{
+			mcp.WithString("name", mcp.Required(), mcp.Description("Task name")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name, _ := req.RequireString("name")
+			if err := DeleteScheduledTask(name); err != nil {
+				return mcp.NewToolResultError("Failed deleting scheduled task: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Scheduled task %q deleted successfully", name)), nil
+		},
+	)
+
+	// ==========================================
+	// 7. Code Analysis & Parsing Tools
+	// ==========================================
+	w.registerTool("get_code_outline", "Parse a code file and extract an outline of functions, structs, types, etc.",
+		[]mcp.ToolOption{
+			mcp.WithString("file_path", mcp.Required(), mcp.Description("Path to code file")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			filePath, _ := req.RequireString("file_path")
+			symbols, err := GetCodeOutline(filePath)
+			if err != nil {
+				return mcp.NewToolResultError("Failed to parse code outline: " + err.Error()), nil
+			}
+			data, _ := json.MarshalIndent(symbols, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	// ==========================================
+	// 8. System Log Inspection Tools
+	// ==========================================
+	w.registerTool("get_system_logs", "Read and parse syslog/system log entries line by line. Queries Windows Event Logs if file_path is empty/not found.",
+		[]mcp.ToolOption{
+			mcp.WithString("file_path", mcp.Description("Path to syslog file (optional, defaults to /var/log/syslog on Unix).")),
+			mcp.WithString("query", mcp.Description("Optional query filter for messages/apps/hosts")),
+			mcp.WithString("severities", mcp.Description("Optional comma-separated list of severities (e.g. info,error)")),
+			mcp.WithNumber("limit", mcp.Description("Optional maximum logs returned (default 100)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			filePath := req.GetString("file_path", "")
+			query := req.GetString("query", "")
+			severitiesStr := req.GetString("severities", "")
+			limitVal := req.GetFloat("limit", 100)
+			limit := int(limitVal)
+
+			var entries []SyslogEntry
+			var err error
+
+			useWindowsLogs := false
+			if runtime.GOOS == "windows" {
+				if filePath == "" || filePath == "/var/log/syslog" {
+					useWindowsLogs = true
+				} else {
+					if _, errStat := os.Stat(filePath); os.IsNotExist(errStat) {
+						useWindowsLogs = true
+					}
+				}
+			}
+
+			if useWindowsLogs {
+				fetchLimit := limit
+				if query != "" || severitiesStr != "" {
+					fetchLimit = limit * 3
+					if fetchLimit > 1000 {
+						fetchLimit = 1000
+					}
+				}
+				entries, err = GetWindowsEventLogs(fetchLimit)
+				if err != nil {
+					return mcp.NewToolResultError("Failed querying Windows Event Logs: " + err.Error()), nil
+				}
+			} else {
+				if filePath == "" {
+					filePath = "/var/log/syslog"
+				}
+				file, err := os.Open(filePath)
+				if err != nil {
+					return mcp.NewToolResultError("Failed to open log file: " + err.Error()), nil
+				}
+				defer file.Close()
+
+				entries, err = ParseSyslog(file)
+				if err != nil {
+					return mcp.NewToolResultError("Failed parsing logs: " + err.Error()), nil
+				}
+			}
+
+			var sevs []LogSeverity
+			if severitiesStr != "" {
+				parts := strings.Split(severitiesStr, ",")
+				for _, p := range parts {
+					trimmed := strings.TrimSpace(p)
+					if trimmed != "" {
+						sevs = append(sevs, LogSeverity(trimmed))
+					}
+				}
+			}
+
+			filter := LogFilter{
+				Severities: sevs,
+				Query:      query,
+				Limit:      limit,
+			}
+
+			filtered := FilterEntries(entries, filter)
+			data, _ := json.MarshalIndent(filtered, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	// ==========================================
+	// 9. File Smart Editing Tools
+	// ==========================================
+	w.registerTool("smart_edit_file", "Apply search-and-replace, scoped, or line replaces to a file",
+		[]mcp.ToolOption{
+			mcp.WithString("file_path", mcp.Required(), mcp.Description("Path to the file to edit")),
+			mcp.WithString("mode", mcp.Required(), mcp.Description("Edit mode: search_replace, scoped_replace, line_replace")),
+			mcp.WithString("search_block", mcp.Description("Exact text block to search for (required for search_replace and scoped_replace)")),
+			mcp.WithString("replace_with", mcp.Required(), mcp.Description("Replacement text block")),
+			mcp.WithNumber("start_line", mcp.Description("Optional starting line number (1-based, inclusive)")),
+			mcp.WithNumber("end_line", mcp.Description("Optional ending line number (1-based, inclusive)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			filePath, _ := req.RequireString("file_path")
+			modeStr, _ := req.RequireString("mode")
+			searchBlock := req.GetString("search_block", "")
+			replaceWith, _ := req.RequireString("replace_with")
+			startLineVal := req.GetFloat("start_line", 0)
+			endLineVal := req.GetFloat("end_line", 0)
+
+			editReq := SmartEditRequest{
+				FilePath:    filePath,
+				Mode:        EditMode(modeStr),
+				SearchBlock: searchBlock,
+				ReplaceWith: replaceWith,
+				StartLine:   int(startLineVal),
+				EndLine:     int(endLineVal),
+			}
+
+			res, err := ApplySmartEdit(editReq)
+			if err != nil {
+				return mcp.NewToolResultError("Failed smart editing file: " + err.Error()), nil
+			}
+
+			data, _ := json.MarshalIndent(res, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	// ==========================================
+	// 10. Timer & Hook Scheduling Tools
+	// ==========================================
+	w.registerTool("timer_schedule_hook", "Schedule a MultiHook string event to trigger after a delay",
+		[]mcp.ToolOption{
+			mcp.WithString("id", mcp.Required(), mcp.Description("Unique identifier for this timer")),
+			mcp.WithString("duration", mcp.Required(), mcp.Description("Delay duration before triggering (e.g. '10s', '5m', '2h')")),
+			mcp.WithString("payload", mcp.Required(), mcp.Description("String payload text to pass to the hook")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id, _ := req.RequireString("id")
+			durStr, _ := req.RequireString("duration")
+			payload, _ := req.RequireString("payload")
+
+			dur, err := time.ParseDuration(durStr)
+			if err != nil {
+				return mcp.NewToolResultError("Invalid duration format: " + err.Error()), nil
+			}
+
+			if err := w.TimerChain.ScheduleTimerHook(id, dur, payload); err != nil {
+				return mcp.NewToolResultError("Failed to schedule timer hook: " + err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Timer hook [%s] scheduled successfully to run in %s", id, durStr)), nil
+		},
+	)
+
+	w.registerTool("timer_cancel", "Cancel an active scheduled timer or recurring task by ID",
+		[]mcp.ToolOption{
+			mcp.WithString("id", mcp.Required(), mcp.Description("Timer or task ID to cancel")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id, _ := req.RequireString("id")
+			w.TimerChain.CancelScheduledItem(id)
+			return mcp.NewToolResultText(fmt.Sprintf("Scheduled item [%s] cancelled successfully", id)), nil
 		},
 	)
 }

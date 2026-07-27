@@ -21,7 +21,7 @@ func TestMCPServerWrapper_Components(t *testing.T) {
 	defer wrapper.StopServer(context.Background())
 
 	// 1. TaskManager integration
-	task, err := wrapper.TaskManager.SubmitCommand("test_echo", "echo", "mcp_hello")
+	task, err := wrapper.TaskManager.SubmitCommand("test_echo", true, "echo", "mcp_hello")
 	if err != nil {
 		t.Fatalf("SubmitCommand failed: %v", err)
 	}

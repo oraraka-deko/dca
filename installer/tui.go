@@ -1,6 +1,7 @@
 package installer
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -27,6 +28,7 @@ const (
 	stateInstalling
 	stateUninstalling
 	stateMessage
+	stateRunningForeground
 )
 
 type actionResultMsg struct {
@@ -37,6 +39,12 @@ type actionResultMsg struct {
 type statusResultMsg struct {
 	status string
 	err    error
+}
+
+type startSrvResultMsg struct {
+	wrapper *utils.MCPServerWrapper
+	cancel  context.CancelFunc
+	err     error
 }
 
 type tuiModel struct {
@@ -64,6 +72,10 @@ type tuiModel struct {
 	protocolIndex int
 	certTypeIndex int
 	authModeIndex int
+
+	// Foreground server wrapper variables
+	foregroundSrv    *utils.MCPServerWrapper
+	foregroundCancel context.CancelFunc
 }
 
 var protocolOptions = []string{"http", "https"}
@@ -79,6 +91,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		// Universal exit
 		if msg.String() == "ctrl+c" {
+			// Stop foreground server if running
+			if m.foregroundCancel != nil {
+				m.foregroundCancel()
+			}
 			return m, tea.Quit
 		}
 
@@ -89,6 +105,17 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.Key().Code == tea.KeyEnter || msg.Key().Code == tea.KeyEsc {
 				m.state = stateMenu
 				return m, checkStatusCmd()
+			}
+		case stateRunningForeground:
+			if msg.Key().Code == tea.KeyEnter || msg.Key().Code == tea.KeyEsc {
+				srv := m.foregroundSrv
+				cancel := m.foregroundCancel
+				m.foregroundSrv = nil
+				m.foregroundCancel = nil
+				m.state = stateInstalling
+				m.infoMessage = "Stopping foreground server..."
+				m.errorMessage = ""
+				return m, stopForegroundServerCmd(srv, cancel)
 			}
 		case stateSetupHost, stateSetupPort, stateSetupProtocol, stateSetupCertType, stateSetupDomain, stateSetupBasePath, stateSetupAuthMode, stateSetupAllowedIPs:
 			return m.updateSetupWizard(msg)
@@ -109,6 +136,17 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMessage = ""
 			m.infoMessage = msg.info
 		}
+
+	case startSrvResultMsg:
+		if msg.err != nil {
+			m.state = stateMessage
+			m.errorMessage = fmt.Sprintf("Failed to start foreground server: %v", msg.err)
+			m.infoMessage = ""
+		} else {
+			m.foregroundSrv = msg.wrapper
+			m.foregroundCancel = msg.cancel
+			m.state = stateRunningForeground
+		}
 	}
 
 	return m, nil
@@ -119,19 +157,19 @@ func (m tuiModel) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyUp:
 		m.menuIndex--
 		if m.menuIndex < 0 {
-			m.menuIndex = 6
+			m.menuIndex = 7
 		}
 	case tea.KeyDown:
 		m.menuIndex++
-		if m.menuIndex > 6 {
+		if m.menuIndex > 7 {
 			m.menuIndex = 0
 		}
 	case tea.KeyEnter:
 		return m.handleMenuSelect()
 	default:
-		// Also allow key numbers 1-7
+		// Also allow key numbers 1-8
 		s := msg.String()
-		if len(s) == 1 && s[0] >= '1' && s[0] <= '7' {
+		if len(s) == 1 && s[0] >= '1' && s[0] <= '8' {
 			m.menuIndex = int(s[0] - '1')
 			return m.handleMenuSelect()
 		}
@@ -175,13 +213,24 @@ func (m tuiModel) handleMenuSelect() (tea.Model, tea.Cmd) {
 		m.infoMessage = "Restarting service..."
 		m.errorMessage = ""
 		return m, restartServiceCmd()
-	case 4: // Interactive Setup
+	case 4: // Run Server (Foreground Mode)
+		cPath := GetDefaultConfigPath()
+		cfg, err := utils.LoadServerConfig(cPath)
+		if err != nil {
+			defaultCfg := utils.DefaultServerConfig()
+			cfg = &defaultCfg
+		}
+		m.state = stateInstalling
+		m.infoMessage = "Starting foreground server..."
+		m.errorMessage = ""
+		return m, startForegroundServerCmd(*cfg)
+	case 5: // Interactive Setup
 		m.startSetupWizard()
 		return m, nil
-	case 5: // Uninstall Service
+	case 6: // Uninstall Service
 		m.state = stateUninstalling
 		return m, uninstallServiceCmd()
-	case 6: // Exit
+	case 7: // Exit
 		return m, tea.Quit
 	}
 	return m, nil
@@ -325,21 +374,6 @@ func (m *tuiModel) decrementSelector() {
 	}
 }
 
-func parseIPList(ipStr string) []string {
-	if ipStr == "" {
-		return []string{}
-	}
-	parts := strings.Split(ipStr, ",")
-	var list []string
-	for _, p := range parts {
-		trimmed := strings.TrimSpace(p)
-		if trimmed != "" {
-			list = append(list, trimmed)
-		}
-	}
-	return list
-}
-
 func (m tuiModel) updateConfirmScreen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Key().Code == tea.KeyEsc {
 		m.state = stateMenu
@@ -376,6 +410,21 @@ func (m tuiModel) updateConfirmScreen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func parseIPList(ipStr string) []string {
+	if ipStr == "" {
+		return []string{}
+	}
+	parts := strings.Split(ipStr, ",")
+	var list []string
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			list = append(list, trimmed)
+		}
+	}
+	return list
+}
+
 func (m tuiModel) View() tea.View {
 	var sb strings.Builder
 
@@ -405,6 +454,7 @@ func (m tuiModel) View() tea.View {
 			"Start Background Service",
 			"Stop Background Service",
 			"Restart Background Service",
+			"Run Server (Foreground Mode)",
 			"Interactive Configuration & Setup",
 			"Uninstall Background Service",
 			"Exit",
@@ -417,7 +467,7 @@ func (m tuiModel) View() tea.View {
 				sb.WriteString(fmt.Sprintf("    %d. %s\n", i+1, opt))
 			}
 		}
-		sb.WriteString("\n\x1b[90m(Use Arrow keys or 1-7 to select, Enter to run)\x1b[0m\n")
+		sb.WriteString("\n\x1b[90m(Use Arrow keys or 1-8 to select, Enter to run)\x1b[0m\n")
 
 	case stateStatus:
 		sb.WriteString(" \x1b[1;36m--- Service Status & Output ---\x1b[0m\n\n")
@@ -455,7 +505,11 @@ func (m tuiModel) View() tea.View {
 		sb.WriteString("\n  \x1b[1;36mDo you want to write config and install this service? [Y/n]: \x1b[0m")
 
 	case stateInstalling:
-		sb.WriteString("\n \x1b[1;36mInstalling service, copying executable, and setting up PATH...\x1b[0m\n")
+		if m.infoMessage != "" {
+			sb.WriteString(fmt.Sprintf("\n \x1b[1;36m%s\x1b[0m\n", m.infoMessage))
+		} else {
+			sb.WriteString("\n \x1b[1;36mInstalling service, copying executable, and setting up PATH...\x1b[0m\n")
+		}
 		sb.WriteString(" Please wait, this may take a moment...\n")
 
 	case stateUninstalling:
@@ -470,6 +524,26 @@ func (m tuiModel) View() tea.View {
 			sb.WriteString(fmt.Sprintf("  \x1b[1;32m%s\x1b[0m\n", m.infoMessage))
 		}
 		sb.WriteString("\n\n\x1b[90mPress Enter to return to main menu...\x1b[0m\n")
+
+	case stateRunningForeground:
+		sb.WriteString(" \x1b[1;32m● RUNNING (Foreground Mode)\x1b[0m\n\n")
+		
+		host := "0.0.0.0"
+		port := 8080
+		proto := "http"
+		path := "/mcp"
+		if m.foregroundSrv != nil {
+			host = m.foregroundSrv.Cfg.Host
+			port = m.foregroundSrv.Cfg.Port
+			proto = m.foregroundSrv.Cfg.Protocol
+			path = m.foregroundSrv.Cfg.CustomBasePath
+		}
+		
+		sb.WriteString("  Server is actively listening at:\n")
+		sb.WriteString(fmt.Sprintf("  \x1b[1;36m%s://%s:%d%s\x1b[0m\n\n", proto, host, port, path))
+		sb.WriteString("  AI agents and clients can connect to this endpoint now.\n")
+		sb.WriteString("  Ensure this terminal remains open.\n\n")
+		sb.WriteString("\x1b[90mPress Esc or Enter to stop the server and return to menu...\x1b[0m\n")
 	}
 
 	return tea.NewView(sb.String())
@@ -602,6 +676,27 @@ func uninstallServiceCmd() tea.Cmd {
 	return func() tea.Msg {
 		err := UninstallService()
 		return actionResultMsg{err: err, info: "Service uninstalled and binaries removed successfully."}
+	}
+}
+
+func startForegroundServerCmd(cfg utils.ServerConfig) tea.Cmd {
+	return func() tea.Msg {
+		wrapper := utils.NewMCPServerWrapper(cfg)
+		ctx, cancel := context.WithCancel(context.Background())
+		err := wrapper.StartServer(ctx)
+		return startSrvResultMsg{wrapper: wrapper, cancel: cancel, err: err}
+	}
+}
+
+func stopForegroundServerCmd(wrapper *utils.MCPServerWrapper, cancel context.CancelFunc) tea.Cmd {
+	return func() tea.Msg {
+		if wrapper != nil {
+			_ = wrapper.StopServer(context.Background())
+		}
+		if cancel != nil {
+			cancel()
+		}
+		return actionResultMsg{info: "Foreground server stopped successfully."}
 	}
 }
 

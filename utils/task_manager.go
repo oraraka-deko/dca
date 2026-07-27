@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -191,9 +193,41 @@ func (tm *TaskManager) SubmitTask(name string, fn TaskFunc) (*Task, error) {
 }
 
 // SubmitCommand enqueues an OS shell/binary command execution task.
-func (tm *TaskManager) SubmitCommand(name string, command string, args ...string) (*Task, error) {
+func (tm *TaskManager) SubmitCommand(name string, useShell bool, command string, args ...string) (*Task, error) {
 	fn := func(ctx context.Context) (string, error) {
-		cmd := exec.CommandContext(ctx, command, args...)
+		var cmd *exec.Cmd
+		if useShell {
+			if runtime.GOOS == "windows" {
+				fullCmd := command
+				if len(args) > 0 {
+					var quotedArgs []string
+					for _, arg := range args {
+						if strings.Contains(arg, " ") || strings.Contains(arg, "\t") {
+							quotedArgs = append(quotedArgs, fmt.Sprintf("\"%s\"", arg))
+						} else {
+							quotedArgs = append(quotedArgs, arg)
+						}
+					}
+					if len(quotedArgs) > 0 {
+						fullCmd += " " + strings.Join(quotedArgs, " ")
+					}
+				}
+				cmd = exec.CommandContext(ctx, "cmd.exe", "/c", fullCmd)
+			} else {
+				fullCmd := command
+				if len(args) > 0 {
+					var quotedArgs []string
+					for _, arg := range args {
+						escaped := strings.ReplaceAll(arg, "'", "'\\''")
+						quotedArgs = append(quotedArgs, fmt.Sprintf("'%s'", escaped))
+					}
+					fullCmd += " " + strings.Join(quotedArgs, " ")
+				}
+				cmd = exec.CommandContext(ctx, "/bin/sh", "-c", fullCmd)
+			}
+		} else {
+			cmd = exec.CommandContext(ctx, command, args...)
+		}
 		out, err := cmd.CombinedOutput()
 		return string(out), err
 	}

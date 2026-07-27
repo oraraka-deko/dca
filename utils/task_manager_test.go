@@ -52,7 +52,7 @@ func TestTaskManager_CommandExecution(t *testing.T) {
 		args = []string{"/c", "echo", "hello", "task"}
 	}
 
-	task, err := tm.SubmitCommand("echo_cmd", cmdName, args...)
+	task, err := tm.SubmitCommand("echo_cmd", false, cmdName, args...)
 	if err != nil {
 		t.Fatalf("failed to submit command: %v", err)
 	}

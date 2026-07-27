@@ -294,18 +294,27 @@ func ManageService(name string, action string) error {
 
 	if runtime.GOOS == "windows" {
 		cmd := exec.Command("sc", action, name)
-		return cmd.Run()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("sc %s failed: %v, output: %s", action, err, strings.TrimSpace(string(out)))
+		}
+		return nil
 	}
 
 	cmd := exec.Command("systemctl", action, name)
-	return cmd.Run()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl %s failed: %v, output: %s", action, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // CreateService creates a system service on Windows or Unix.
 func CreateService(name string, displayName string, binPath string) error {
 	if runtime.GOOS == "windows" {
 		cmd := exec.Command("sc", "create", name, "binPath=", binPath, "DisplayName=", displayName, "start=", "auto")
-		return cmd.Run()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("sc create failed: %v, output: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
 	}
 
 	// For Unix: Write systemd unit file (requires root privileges)
@@ -328,7 +337,11 @@ WantedBy=multi-user.target
 	}
 
 	// Reload systemd daemon
-	return exec.Command("systemctl", "daemon-reload").Run()
+	cmd := exec.Command("systemctl", "daemon-reload")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl daemon-reload failed: %v, output: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // ListScheduledTasks lists scheduled tasks / cron jobs on Windows or Unix.
@@ -484,17 +497,90 @@ func matchTask(t ScheduledTaskInfo, query string) bool {
 		strings.Contains(strings.ToLower(t.Status), query)
 }
 
+// parseCronToSchtasks parses simple cron expressions into Windows schtasks arguments.
+func parseCronToSchtasks(cron string) (schedule string, modifier string, startTime string, day string, err error) {
+	cron = strings.TrimSpace(cron)
+	fields := strings.Fields(cron)
+	if len(fields) != 5 {
+		return "", "", "", "", fmt.Errorf("invalid cron expression format: must have exactly 5 fields")
+	}
+
+	minute, hour, dom, month, dow := fields[0], fields[1], fields[2], fields[3], fields[4]
+
+	// 1. Check for minutes interval: */N * * * *
+	if strings.HasPrefix(minute, "*/") && hour == "*" && dom == "*" && month == "*" && dow == "*" {
+		minValStr := strings.TrimPrefix(minute, "*/")
+		if _, err := strconv.Atoi(minValStr); err == nil {
+			return "MINUTE", minValStr, "", "", nil
+		}
+	}
+
+	// 2. Check for hourly: M * * * *
+	if _, err1 := strconv.Atoi(minute); err1 == nil && hour == "*" && dom == "*" && month == "*" && dow == "*" {
+		return "HOURLY", "1", "", "", nil
+	}
+
+	// 3. Check for daily: M H * * *
+	mVal, err1 := strconv.Atoi(minute)
+	hVal, err2 := strconv.Atoi(hour)
+	if err1 == nil && err2 == nil && dom == "*" && month == "*" && dow == "*" {
+		st := fmt.Sprintf("%02d:%02d", hVal, mVal)
+		return "DAILY", "", st, "", nil
+	}
+
+	// 4. Check for weekly: M H * * D
+	dVal, err3 := strconv.Atoi(dow)
+	if err1 == nil && err2 == nil && dom == "*" && month == "*" && err3 == nil {
+		st := fmt.Sprintf("%02d:%02d", hVal, mVal)
+		days := []string{"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
+		if dVal >= 0 && dVal <= 7 {
+			return "WEEKLY", "", st, days[dVal], nil
+		}
+	}
+
+	// 5. Check for monthly: M H D * *
+	domVal, err4 := strconv.Atoi(dom)
+	if err1 == nil && err2 == nil && err4 == nil && month == "*" && dow == "*" {
+		st := fmt.Sprintf("%02d:%02d", hVal, mVal)
+		if domVal >= 1 && domVal <= 31 {
+			return "MONTHLY", "", st, strconv.Itoa(domVal), nil
+		}
+	}
+
+	return "", "", "", "", fmt.Errorf("unsupported complex cron expression on Windows: %s. Use simple expressions or standard Windows frequency (MINUTE, HOURLY, DAILY, WEEKLY, MONTHLY, ONCE, etc.)", cron)
+}
+
 // CreateScheduledTask schedules a new task on Windows or Unix crontab.
 func CreateScheduledTask(name string, taskRun string, schedule string, startTime string) error {
 	if runtime.GOOS == "windows" {
-		// schtasks /create /tn name /tr taskRun /sc schedule /st startTime
-		args := []string{"/create", "/tn", name, "/tr", taskRun, "/sc", schedule}
+		sc := strings.ToUpper(strings.TrimSpace(schedule))
+		var modifier, day string
+
+		if strings.ContainsAny(schedule, " \t*") {
+			var err error
+			sc, modifier, startTime, day, err = parseCronToSchtasks(schedule)
+			if err != nil {
+				return fmt.Errorf("failed to parse schedule as cron for Windows: %w", err)
+			}
+		}
+
+		args := []string{"/create", "/tn", name, "/tr", taskRun, "/sc", sc}
+		if modifier != "" {
+			args = append(args, "/mo", modifier)
+		}
 		if startTime != "" {
 			args = append(args, "/st", startTime)
 		}
+		if day != "" {
+			args = append(args, "/d", day)
+		}
 		args = append(args, "/f") // overwrite if exists
+
 		cmd := exec.Command("schtasks", args...)
-		return cmd.Run()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("schtasks failed: %v, output: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
 	}
 
 	// For Unix: Add to cron (schedule is cron format, e.g. "0 5 * * *")
@@ -509,14 +595,20 @@ func CreateScheduledTask(name string, taskRun string, schedule string, startTime
 
 	cmd := exec.Command("crontab", "-")
 	cmd.Stdin = strings.NewReader(updatedContent)
-	return cmd.Run()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("crontab failed: %v, output: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // DeleteScheduledTask removes a scheduled task or cron job.
 func DeleteScheduledTask(name string) error {
 	if runtime.GOOS == "windows" {
 		cmd := exec.Command("schtasks", "/delete", "/tn", name, "/f")
-		return cmd.Run()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("schtasks delete failed: %v, output: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
 	}
 
 	// For Unix: Remove line containing `# name` comment
@@ -539,5 +631,8 @@ func DeleteScheduledTask(name string) error {
 	updatedContent := strings.Join(keptLines, "\n")
 	cmd := exec.Command("crontab", "-")
 	cmd.Stdin = strings.NewReader(updatedContent)
-	return cmd.Run()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("crontab delete failed: %v, output: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
