@@ -46,9 +46,8 @@ MimeType=%s
 
 	// 4. Install to Desktop (~/Desktop)
 	desktopDir := filepath.Join(home, "Desktop")
-	if _, err := os.Stat(desktopDir); err == nil {
-		os.WriteFile(filepath.Join(desktopDir, desktopFileName), []byte(desktopContent), 0755)
-	}
+	_ = os.MkdirAll(desktopDir, 0755)
+	_ = os.WriteFile(filepath.Join(desktopDir, desktopFileName), []byte(desktopContent), 0755)
 
 	return nil
 }
