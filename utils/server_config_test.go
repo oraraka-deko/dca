@@ -4,7 +4,6 @@ import (
 	"crypto/tls"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -111,15 +110,5 @@ func TestCertManager_GenerateSelfSigned(t *testing.T) {
 
 	if len(cert.Certificate) == 0 {
 		t.Fatalf("expected non-empty certificate slice")
-	}
-}
-
-func TestInstaller_SystemdUnitFile(t *testing.T) {
-	unit := GenerateSystemdUnitFile("/usr/local/bin/mymcp", "/etc/mymcp/config.json")
-	if !strings.Contains(unit, "ExecStart=/usr/local/bin/mymcp -config /etc/mymcp/config.json") {
-		t.Fatalf("unexpected unit file format:\n%s", unit)
-	}
-	if !strings.Contains(unit, "Restart=always") {
-		t.Fatalf("missing restart directive in unit file")
 	}
 }

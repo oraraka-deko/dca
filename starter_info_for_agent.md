@@ -77,6 +77,8 @@ func main() {
 
 # plan for once server first test release of that being ready for use  
 
+** after firt realtime test goes wrong Should implanting database for storing config things encrypted and saving mcp history and logs for debug and other things...
+
 ** Agent access to terminal or shell  with handle for each platform and different possible command line they has like powershell cmd , bash sh fish zsh 
 
 ** a watch dog to accidentally model not with running to much tasks booom explode server

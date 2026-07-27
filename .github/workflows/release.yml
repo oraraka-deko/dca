@@ -6,11 +6,20 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      prerelease:
-        description: 'Publish as pre-release'
+      version:
+        description: 'Version override (e.g. v1.0.0)'
         required: false
-        type: boolean
-        default: true
+        default: ''
+        type: string
+      release_type:
+        description: 'Release publishing type'
+        required: true
+        default: 'artifacts'
+        type: choice
+        options:
+          - stable
+          - prerelease
+          - artifacts
 
 permissions:
   contents: write
@@ -29,7 +38,7 @@ jobs:
           go-version: '1.22'
 
       - name: Run Tests
-        run: go test -v ./utils
+        run: go test -v ./...
 
   build-and-release:
     name: Cross-Compile and Publish Release
@@ -47,12 +56,16 @@ jobs:
       - name: Get Version Tag
         id: get_version
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          if [ "$VERSION" = "$GITHUB_REF" ]; then
-            VERSION="v0.1.0-test"
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+            if [ "$VERSION" = "$GITHUB_REF" ]; then
+              VERSION="v0.1.0-test"
+            fi
           fi
           echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Tag version is $VERSION"
+          echo "Build version is $VERSION"
 
       - name: Build Binaries
         run: |
@@ -78,16 +91,46 @@ jobs:
           GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o build/mymcp-darwin-arm64 .
           tar -czvf dist/mymcp-darwin-arm64-${{ env.VERSION }}.tar.gz -C build mymcp-darwin-arm64
 
-      - name: Determine Prerelease Flag
-        id: is_prerelease
+      - name: Determine Prerelease and Release Flags
+        id: flags
         run: |
-          if [[ "${{ inputs.prerelease }}" == "true" ]] || [[ "${{ env.VERSION }}" == *"-beta"* ]] || [[ "${{ env.VERSION }}" == *"-rc"* ]] || [[ "${{ env.VERSION }}" == *"-alpha"* ]] || [[ "${{ env.VERSION }}" == *"-test"* ]]; then
-            echo "IS_PRERELEASE=true" >> $GITHUB_ENV
+          REL_TYPE="${{ github.event.inputs.release_type }}"
+          
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # Automatic tag push defaults to release publication
+            DO_RELEASE="true"
+            if [[ "${{ env.VERSION }}" == *"-beta"* ]] || [[ "${{ env.VERSION }}" == *"-rc"* ]] || [[ "${{ env.VERSION }}" == *"-alpha"* ]] || [[ "${{ env.VERSION }}" == *"-test"* ]]; then
+              IS_PRERELEASE="true"
+            else
+              IS_PRERELEASE="false"
+            fi
           else
-            echo "IS_PRERELEASE=false" >> $GITHUB_ENV
+            # Manual workflow dispatch input determines behavior
+            if [ "$REL_TYPE" = "artifacts" ]; then
+              DO_RELEASE="false"
+              IS_PRERELEASE="false"
+            elif [ "$REL_TYPE" = "prerelease" ]; then
+              DO_RELEASE="true"
+              IS_PRERELEASE="true"
+            else
+              # stable
+              DO_RELEASE="true"
+              IS_PRERELEASE="false"
+            fi
           fi
+          echo "DO_RELEASE=$DO_RELEASE" >> $GITHUB_ENV
+          echo "IS_PRERELEASE=$IS_PRERELEASE" >> $GITHUB_ENV
+          echo "Release publishing: $DO_RELEASE (prerelease: $IS_PRERELEASE)"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mymcp-binaries-${{ env.VERSION }}
+          path: dist/*
+          retention-days: 30
 
       - name: Create GitHub Release
+        if: ${{ env.DO_RELEASE == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}

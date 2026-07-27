@@ -19,28 +19,49 @@
 
 ## 📦 Quick Start
 
-### 1. Download & Installation
+### 1. Interactive Manager (TUI)
 
-Download the binary for your platform from [Releases](https://github.com/oraraka-deko/dca/releases) and run:
+Running the binary without arguments in any interactive terminal (on Windows or Linux/Unix) launches the built-in **Terminal User Interface (TUI)** manager:
 
 ```bash
-# Install as a system background service
-./mymcp install
-
-# Check service status
-./mymcp status
-
-# Manage background service
-./mymcp start
-./mymcp stop
-./mymcp restart
-./mymcp uninstall
+./mymcp
 ```
 
-### 2. Run Directly in Foreground
+Through the TUI, you can:
+- View current service status.
+- Start, stop, or restart the background service.
+- Run the interactive **Setup Wizard** to configure the host, port, protocol (HTTP/HTTPS), certificates, custom base path, and IP whitelists.
+- Install or uninstall the service.
+
+When you install the service, the installer automatically copies and renames the executable to a system-wide path (`/usr/local/bin/mymcp` on Unix/Linux, `C:\ProgramData\mymcp\mymcp.exe` on Windows) and adds it to your environment `PATH` (on Windows). Once installed, you can run the `mymcp` command from any folder in your terminal!
+
+### 2. CLI Administration
+
+If you prefer to administer the service directly from the command line, you can use the following commands:
 
 ```bash
-./mymcp -config /path/to/config.json
+# Start background service
+mymcp start
+
+# Stop background service
+mymcp stop
+
+# Restart background service
+mymcp restart
+
+# Check service status details
+mymcp status
+
+# Uninstall background service
+mymcp uninstall
+```
+
+### 3. Run Directly in Foreground
+
+If you want to run the server directly in the foreground without registering it as a background service:
+
+```bash
+mymcp -config /path/to/config.json
 ```
 
 ---

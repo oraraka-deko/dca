@@ -1,12 +1,15 @@
-package utils
+package installer
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"dca/utils"
 )
 
 // GetDefaultConfigPath returns the standard configuration file path based on OS.
@@ -39,27 +42,81 @@ WantedBy=multi-user.target
 `, exePath, configPath)
 }
 
+func copyFile(src, dst string) error {
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	_ = os.Remove(dst)
+
+	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
+}
+
 // InstallService registers and enables the mymcp background service on the host system.
-func InstallService(cfg ServerConfig, configPath string) error {
+func InstallService(cfg utils.ServerConfig, configPath string) error {
 	if configPath == "" {
 		configPath = GetDefaultConfigPath()
 	}
 
-	// Save configuration first
+	// 1. Stop existing service to unlock files and prevent issues
+	_ = StopService()
+
+	// 2. Locate current running binary
+	currExe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to locate current executable: %w", err)
+	}
+
+	var finalExePath string
+	switch runtime.GOOS {
+	case "linux":
+		finalExePath = "/usr/local/bin/mymcp"
+		if err := copyFile(currExe, finalExePath); err != nil {
+			return fmt.Errorf("failed to copy binary to %s: %w", finalExePath, err)
+		}
+	case "windows":
+		progData := os.Getenv("ProgramData")
+		if progData == "" {
+			progData = `C:\ProgramData`
+		}
+		installDir := filepath.Join(progData, "mymcp")
+		finalExePath = filepath.Join(installDir, "mymcp.exe")
+		if err := copyFile(currExe, finalExePath); err != nil {
+			return fmt.Errorf("failed to copy binary to %s: %w", finalExePath, err)
+		}
+		// Update PATH to include installDir
+		if err := AddFolderToUserPath(installDir); err != nil {
+			fmt.Printf("Warning: failed to add %s to user PATH: %v\n", installDir, err)
+		}
+	default:
+		return fmt.Errorf("unsupported OS for service installation: %s", runtime.GOOS)
+	}
+
+	// 3. Save configuration
 	if err := cfg.SaveToFile(configPath); err != nil {
 		return fmt.Errorf("failed saving service config: %w", err)
 	}
 
-	exePath, err := os.Executable()
-	if err != nil {
-		exePath = "mymcp"
-	}
-
+	// 4. Register and start service pointing to the copied binary
 	switch runtime.GOOS {
 	case "linux":
-		return installLinuxService(exePath, configPath)
+		return installLinuxService(finalExePath, configPath)
 	case "windows":
-		return installWindowsService(exePath, configPath)
+		return installWindowsService(finalExePath, configPath)
 	default:
 		return fmt.Errorf("unsupported OS for service installation: %s", runtime.GOOS)
 	}
@@ -103,13 +160,19 @@ func UninstallService() error {
 		_ = exec.Command("systemctl", "disable", "mymcp").Run()
 		_ = os.Remove("/etc/systemd/system/mymcp.service")
 		_ = exec.Command("systemctl", "daemon-reload").Run()
+		_ = os.Remove("/usr/local/bin/mymcp")
 		return nil
 	case "windows":
 		_ = exec.Command("sc.exe", "stop", "mymcp").Run()
 		out, err := exec.Command("sc.exe", "delete", "mymcp").CombinedOutput()
-		if err != nil {
+		if err != nil && !strings.Contains(string(out), "1060") { // Ignore if service does not exist
 			return fmt.Errorf("failed deleting windows service: %v\nOutput: %s", err, string(out))
 		}
+		progData := os.Getenv("ProgramData")
+		if progData == "" {
+			progData = `C:\ProgramData`
+		}
+		_ = os.Remove(filepath.Join(progData, "mymcp", "mymcp.exe"))
 		return nil
 	default:
 		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
@@ -147,7 +210,7 @@ func StopService() error {
 		return nil
 	case "windows":
 		out, err := exec.Command("sc.exe", "stop", "mymcp").CombinedOutput()
-		if err != nil {
+		if err != nil && !strings.Contains(string(out), "1062") { // Ignore if service has not been started
 			return fmt.Errorf("failed stopping service: %v\nOutput: %s", err, string(out))
 		}
 		return nil
