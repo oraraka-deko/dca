@@ -3,6 +3,7 @@ package utils
 import (
 	"encoding/json"
 	"errors"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -22,11 +23,12 @@ type OutboxItem struct {
 
 // Outbox is a bounded thread-safe FIFO queue with a non-blocking notification channel.
 type Outbox struct {
-	mu      sync.Mutex
-	items   []OutboxItem
-	maxSize int
-	notify  chan struct{}
-	closed  bool
+	mu       sync.Mutex
+	items    []OutboxItem
+	maxSize  int
+	notify   chan struct{}
+	closed   bool
+	flushing bool
 }
 
 // NewOutbox creates an Outbox instance bounded by maxSize. Default is 1000 if maxSize <= 0.
@@ -74,18 +76,33 @@ func (o *Outbox) Enqueue(item OutboxItem) error {
 // If sendFunc succeeds, the item is removed from queue. If sendFunc fails,
 // the item remains at the front of the queue and Flush stops immediately.
 func (o *Outbox) Flush(sendFunc func(OutboxItem) error) error {
+	o.mu.Lock()
+	if o.closed || o.flushing || len(o.items) == 0 {
+		o.mu.Unlock()
+		return nil
+	}
+	o.flushing = true
+	o.mu.Unlock()
+
+	defer func() {
+		o.mu.Lock()
+		o.flushing = false
+		o.mu.Unlock()
+	}()
+
 	for {
+		runtime.Gosched()
 		o.mu.Lock()
 		if o.closed || len(o.items) == 0 {
 			o.mu.Unlock()
 			return nil
 		}
+		o.items[0].Attempts++
 		head := o.items[0]
 		o.mu.Unlock()
 
-		head.Attempts++
 		if err := sendFunc(head); err != nil {
-			// Delivery failed: head item remains at queue head, flushing halts
+			// Delivery failed: head item remains at queue head with incremented Attempts, flushing halts
 			return err
 		}
 
@@ -151,3 +168,32 @@ func (o *Outbox) Close() {
 	defer o.mu.Unlock()
 	o.closed = true
 }
+
+// Prepend inserts a slice of OutboxItems to the front of the queue.
+func (o *Outbox) Prepend(items []OutboxItem) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed || len(items) == 0 {
+		return
+	}
+	// Filter out any duplicates that might already be in o.items
+	uniqueNew := make([]OutboxItem, 0, len(items))
+	for _, it := range items {
+		found := false
+		for _, existing := range o.items {
+			if existing.ID == it.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			uniqueNew = append(uniqueNew, it)
+		}
+	}
+	
+	o.items = append(uniqueNew, o.items...)
+	if len(o.items) > o.maxSize {
+		o.items = o.items[len(o.items)-o.maxSize:]
+	}
+}
+

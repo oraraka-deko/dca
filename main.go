@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"dca/installer"
 	"dca/utils"
+
 	isatty "github.com/mattn/go-isatty"
 )
 
@@ -19,21 +21,29 @@ func isTerminal() bool {
 
 // ParseCLIArgs parses global and subcommand flags, loads configuration, applies env overrides and validates.
 func ParseCLIArgs(args []string, defaultConfigPath string) (*utils.ServerConfig, string, error) {
-	topFlags := flag.NewFlagSet("mcp", flag.ContinueOnError)
-	topConfig := topFlags.String("config", "", "Path to server configuration JSON file")
-
-	if err := topFlags.Parse(args); err != nil {
-		return nil, "", err
+	// 1. First scan args manually for top-level --config or subcommand --config
+	var configFilePath string
+	for i, a := range args {
+		if (a == "--config" || a == "-config") && i+1 < len(args) {
+			configFilePath = args[i+1]
+			break
+		} else if strings.HasPrefix(a, "--config=") {
+			configFilePath = strings.TrimPrefix(a, "--config=")
+			break
+		} else if strings.HasPrefix(a, "-config=") {
+			configFilePath = strings.TrimPrefix(a, "-config=")
+			break
+		}
 	}
 
-	cPath := *topConfig
-	if cPath == "" {
-		cPath = defaultConfigPath
+	if configFilePath == "" {
+		configFilePath = defaultConfigPath
 	}
 
+	// 2. Base configuration: Config file if exists, else DefaultServerConfig()
 	var cfg *utils.ServerConfig
-	if cPath != "" {
-		if loaded, err := utils.LoadServerConfig(cPath); err == nil {
+	if configFilePath != "" {
+		if loaded, err := utils.LoadServerConfig(configFilePath); err == nil {
 			cfg = loaded
 		}
 	}
@@ -42,17 +52,37 @@ func ParseCLIArgs(args []string, defaultConfigPath string) (*utils.ServerConfig,
 		cfg = &defaultCfg
 	}
 
-	remaining := topFlags.Args()
-	if len(remaining) == 0 {
-		cfg.ApplyEnvOverrides()
+	// 3. Overlay Environment Variables (Env overrides file config)
+	cfg.ApplyEnvOverrides()
+
+	// 4. Parse Subcommand and CLI Flags (CLI flags override Env & File config)
+	if len(args) == 0 {
 		if err := cfg.Validate(); err != nil {
 			return nil, "", err
 		}
 		return cfg, "default", nil
 	}
 
-	subcmd := remaining[0]
-	subArgs := remaining[1:]
+	// Check if first arg is top-level flag or subcommand
+	subcmd := args[0]
+	subArgs := args[1:]
+
+	if strings.HasPrefix(subcmd, "-") {
+		topFlags := flag.NewFlagSet("mcp", flag.ContinueOnError)
+		_ = topFlags.String("config", "", "Path to server configuration JSON file")
+		if err := topFlags.Parse(args); err != nil {
+			return nil, "", err
+		}
+		rem := topFlags.Args()
+		if len(rem) == 0 {
+			if err := cfg.Validate(); err != nil {
+				return nil, "", err
+			}
+			return cfg, "default", nil
+		}
+		subcmd = rem[0]
+		subArgs = rem[1:]
+	}
 
 	switch subcmd {
 	case "status":
@@ -72,33 +102,27 @@ func ParseCLIArgs(args []string, defaultConfigPath string) (*utils.ServerConfig,
 
 	case "king":
 		kingCmd := flag.NewFlagSet("king", flag.ContinueOnError)
-		kingPort := kingCmd.Int("port", 0, "Server HTTP port")
-		kingIngressPort := kingCmd.Int("ingress-port", 0, "King ingress port for workers")
-		kingAuthToken := kingCmd.String("auth-token", "", "Authentication token")
-		kingConfig := kingCmd.String("config", "", "Path to server configuration JSON file")
+		kingPort := kingCmd.Int("port", cfg.Port, "Server HTTP port")
+		kingIngressPort := kingCmd.Int("ingress-port", cfg.IngressPort, "King ingress port for workers")
+		kingAuthToken := kingCmd.String("auth-token", cfg.AuthToken, "Authentication token")
+		_ = kingCmd.String("config", "", "Path to server configuration JSON file")
 
 		if err := kingCmd.Parse(subArgs); err != nil {
 			return nil, "", err
 		}
 
-		if *kingConfig != "" {
-			if loaded, err := utils.LoadServerConfig(*kingConfig); err == nil {
-				cfg = loaded
-			}
-		}
-
 		cfg.KingMode = true
-		if *kingPort != 0 {
-			cfg.Port = *kingPort
-		}
-		if *kingIngressPort != 0 {
-			cfg.IngressPort = *kingIngressPort
-		}
-		if *kingAuthToken != "" {
-			cfg.AuthToken = *kingAuthToken
-		}
+		kingCmd.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "port":
+				cfg.Port = *kingPort
+			case "ingress-port":
+				cfg.IngressPort = *kingIngressPort
+			case "auth-token":
+				cfg.AuthToken = *kingAuthToken
+			}
+		})
 
-		cfg.ApplyEnvOverrides()
 		if err := cfg.Validate(); err != nil {
 			return nil, "", err
 		}
@@ -106,76 +130,73 @@ func ParseCLIArgs(args []string, defaultConfigPath string) (*utils.ServerConfig,
 
 	case "worker":
 		workerCmd := flag.NewFlagSet("worker", flag.ContinueOnError)
-		workerKing := workerCmd.String("king", "", "King server address")
-		workerPairCode := workerCmd.String("pair-code", "", "Pairing code")
-		workerNodeID := workerCmd.String("node-id", "", "Worker Node ID")
-		workerConfig := workerCmd.String("config", "", "Path to server configuration JSON file")
+		workerKing := workerCmd.String("king", cfg.KingAddress, "King server address")
+		workerPairCode := workerCmd.String("pair-code", cfg.PairCode, "Pairing code")
+		workerNodeID := workerCmd.String("node-id", cfg.NodeID, "Worker Node ID")
+		_ = workerCmd.String("config", "", "Path to server configuration JSON file")
 
 		if err := workerCmd.Parse(subArgs); err != nil {
 			return nil, "", err
 		}
 
-		if *workerConfig != "" {
-			if loaded, err := utils.LoadServerConfig(*workerConfig); err == nil {
-				cfg = loaded
-			}
-		}
-
 		cfg.WorkerMode = true
-		if *workerKing != "" {
-			cfg.KingAddress = *workerKing
-		}
-		if *workerPairCode != "" {
-			cfg.PairCode = *workerPairCode
-		}
-		if *workerNodeID != "" {
-			cfg.NodeID = *workerNodeID
-		}
+		workerCmd.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "king":
+				cfg.KingAddress = *workerKing
+			case "pair-code":
+				cfg.PairCode = *workerPairCode
+			case "node-id":
+				cfg.NodeID = *workerNodeID
+			}
+		})
 
-		cfg.ApplyEnvOverrides()
 		if err := cfg.Validate(); err != nil {
 			return nil, "", err
 		}
 		return cfg, "worker", nil
 
 	case "pair":
-		pairCmd := flag.NewFlagSet("pair", flag.ContinueOnError)
-		pairCodeFlag := pairCmd.String("code", "", "Pairing code")
-		pairKing := pairCmd.String("king", "", "King server address")
-		pairNodeID := pairCmd.String("node-id", "", "Worker Node ID")
-		pairConfig := pairCmd.String("config", "", "Path to server configuration JSON file")
+		var positionalCode string
+		var cleanSubArgs []string
+		if len(subArgs) > 0 && !strings.HasPrefix(subArgs[0], "-") {
+			positionalCode = subArgs[0]
+			cleanSubArgs = subArgs[1:]
+		} else {
+			cleanSubArgs = subArgs
+		}
 
-		if err := pairCmd.Parse(subArgs); err != nil {
+		pairCmd := flag.NewFlagSet("pair", flag.ContinueOnError)
+		pairCodeFlag := pairCmd.String("code", cfg.PairCode, "Pairing code")
+		pairKing := pairCmd.String("king", cfg.KingAddress, "King server address")
+		pairNodeID := pairCmd.String("node-id", cfg.NodeID, "Worker Node ID")
+		_ = pairCmd.String("config", "", "Path to server configuration JSON file")
+
+		if err := pairCmd.Parse(cleanSubArgs); err != nil {
 			return nil, "", err
 		}
 
-		code := *pairCodeFlag
-		if code == "" && len(pairCmd.Args()) > 0 {
-			code = pairCmd.Args()[0]
-		}
-
-		if code != "" && !utils.ValidatePairingCode(code) {
-			return nil, "", fmt.Errorf("invalid pairing code format: %s", code)
-		}
-
-		if *pairConfig != "" {
-			if loaded, err := utils.LoadServerConfig(*pairConfig); err == nil {
-				cfg = loaded
-			}
-		}
-
 		cfg.WorkerMode = true
+		code := positionalCode
+		pairCmd.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "code":
+				code = *pairCodeFlag
+			case "king":
+				cfg.KingAddress = *pairKing
+			case "node-id":
+				cfg.NodeID = *pairNodeID
+			}
+		})
+
 		if code != "" {
 			cfg.PairCode = code
 		}
-		if *pairKing != "" {
-			cfg.KingAddress = *pairKing
-		}
-		if *pairNodeID != "" {
-			cfg.NodeID = *pairNodeID
+
+		if cfg.PairCode != "" && !utils.ValidatePairingCode(cfg.PairCode) {
+			return nil, "", fmt.Errorf("invalid pairing code format: %s", cfg.PairCode)
 		}
 
-		cfg.ApplyEnvOverrides()
 		if err := cfg.Validate(); err != nil {
 			return nil, "", err
 		}

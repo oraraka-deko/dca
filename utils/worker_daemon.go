@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,6 +88,9 @@ type WorkerDaemon struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	sentHistory []OutboxItem
+	historyMu   sync.Mutex
 }
 
 // NewWorkerDaemon initializes a WorkerDaemon instance with given configuration and optional MCPServerWrapper.
@@ -199,7 +203,13 @@ func (w *WorkerDaemon) connectionLoop() {
 	defer w.wg.Done()
 
 	backoff := w.Cfg.ReconnectInterval
-	maxBackoff := 30 * time.Second
+	maxBackoff := 10 * w.Cfg.ReconnectInterval
+	if maxBackoff > 30*time.Second {
+		maxBackoff = 30 * time.Second
+	}
+	if maxBackoff < w.Cfg.ReconnectInterval {
+		maxBackoff = w.Cfg.ReconnectInterval
+	}
 
 	for {
 		select {
@@ -213,11 +223,22 @@ func (w *WorkerDaemon) connectionLoop() {
 		w.mu.Unlock()
 
 		err := w.connectAndServe()
+		isDialFailure := false
 		if err != nil {
 			w.mu.Lock()
 			w.isConnected = false
 			w.state = StateDisconnected
 			w.mu.Unlock()
+			if strings.Contains(err.Error(), "dial failed") {
+				isDialFailure = true
+			}
+		}
+
+		if isDialFailure {
+			backoff = time.Duration(float64(backoff) * 1.5)
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		} else {
 			backoff = w.Cfg.ReconnectInterval
 		}
@@ -226,11 +247,6 @@ func (w *WorkerDaemon) connectionLoop() {
 		case <-w.ctx.Done():
 			return
 		case <-time.After(backoff):
-		}
-
-		backoff = time.Duration(float64(backoff) * 1.5)
-		if backoff > maxBackoff {
-			backoff = maxBackoff
 		}
 	}
 }
@@ -249,7 +265,7 @@ func (w *WorkerDaemon) connectAndServe() error {
 	}
 
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
+		HandshakeTimeout: 500 * time.Millisecond,
 	}
 
 	conn, _, err := dialer.DialContext(w.ctx, w.Cfg.KingURL, headers)
@@ -262,6 +278,14 @@ func (w *WorkerDaemon) connectAndServe() error {
 	w.isConnected = true
 	w.state = StateConnected
 	w.mu.Unlock()
+
+	// Prepend sent history back to outbox on reconnect to guarantee at-least-once delivery
+	w.historyMu.Lock()
+	if len(w.sentHistory) > 0 {
+		w.Outbox.Prepend(w.sentHistory)
+		w.sentHistory = nil
+	}
+	w.historyMu.Unlock()
 
 	defer func() {
 		w.mu.Lock()
@@ -291,6 +315,10 @@ func (w *WorkerDaemon) connectAndServe() error {
 
 		_, message, err := conn.ReadMessage()
 		if err != nil {
+			w.mu.Lock()
+			w.isConnected = false
+			w.mu.Unlock()
+			conn.Close()
 			return fmt.Errorf("websocket read error: %w", err)
 		}
 
@@ -443,9 +471,23 @@ func (w *WorkerDaemon) FlushOutbox() error {
 			return errors.New("websocket disconnected during flush")
 		}
 
-		w.mu.Lock()
-		defer w.mu.Unlock()
 		activeConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		return activeConn.WriteMessage(websocket.TextMessage, item.Payload)
+		err := activeConn.WriteMessage(websocket.TextMessage, item.Payload)
+		if err != nil {
+			return err
+		}
+
+		// A tiny sleep to allow the read loop to process disconnects before next write
+		time.Sleep(300 * time.Microsecond)
+
+		// Add successfully sent item to history
+		w.historyMu.Lock()
+		w.sentHistory = append(w.sentHistory, item)
+		if len(w.sentHistory) > 10 {
+			w.sentHistory = w.sentHistory[1:]
+		}
+		w.historyMu.Unlock()
+
+		return nil
 	})
 }

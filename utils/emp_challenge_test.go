@@ -228,8 +228,15 @@ func TestEmpirical_WorkerDaemon_RapidDisconnectReconnect(t *testing.T) {
 	enqueueWg.Wait()
 
 	// Wait for worker daemon to reconnect and flush outbox
-	time.Sleep(500 * time.Millisecond)
-	_ = daemon.FlushOutbox()
+	for i := 0; i < 100; i++ {
+		if daemon.IsConnected() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := daemon.FlushOutbox(); err != nil {
+		t.Logf("Final FlushOutbox error: %v", err)
+	}
 	time.Sleep(200 * time.Millisecond)
 
 	recMu.Lock()
