@@ -1132,6 +1132,90 @@ func (w *MCPServerWrapper) RegisterAllTools() {
 			return mcp.NewToolResultText(string(data)), nil
 		},
 	)
+
+	// ==========================================
+	// SSH Native Management Tools
+	// ==========================================
+	w.registerTool("ssh_execute_command", "Executes a command on a remote server natively over SSH in Go (supports password & SSH key auth)",
+		[]mcp.ToolOption{
+			mcp.WithString("host", mcp.Required(), mcp.Description("Remote SSH hostname or IP address")),
+			mcp.WithNumber("port", mcp.Description("SSH port (default 22)")),
+			mcp.WithString("user", mcp.Required(), mcp.Description("SSH username")),
+			mcp.WithString("password", mcp.Description("SSH password (optional if key_path/key_content provided)")),
+			mcp.WithString("key_path", mcp.Description("Path to private key file on local system")),
+			mcp.WithString("key_content", mcp.Description("Raw private key PEM string")),
+			mcp.WithString("passphrase", mcp.Description("Passphrase for encrypted private key")),
+			mcp.WithString("command", mcp.Required(), mcp.Description("Command string to run remotely")),
+			mcp.WithNumber("timeout_seconds", mcp.Description("Timeout in seconds (default 60)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			host, _ := req.RequireString("host")
+			user, _ := req.RequireString("user")
+			command, _ := req.RequireString("command")
+
+			port := int(req.GetFloat("port", 22))
+			password := req.GetString("password", "")
+			keyPath := req.GetString("key_path", "")
+			keyContent := req.GetString("key_content", "")
+			passphrase := req.GetString("passphrase", "")
+			timeoutSec := req.GetFloat("timeout_seconds", 60)
+
+			sshMgr := NewSSHClientManager()
+			authOpts := SSHAuthOptions{
+				Password:   password,
+				KeyPath:    keyPath,
+				KeyContent: keyContent,
+				Passphrase: passphrase,
+			}
+
+			res, err := sshMgr.ExecuteRemoteCommand(ctx, host, port, user, authOpts, command, time.Duration(timeoutSec)*time.Second)
+			if err != nil {
+				return mcp.NewToolResultError("SSH execution failed: " + err.Error()), nil
+			}
+
+			data, _ := json.MarshalIndent(res, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	w.registerTool("ssh_test_connection", "Test SSH network reachability and credentials for a remote host",
+		[]mcp.ToolOption{
+			mcp.WithString("host", mcp.Required(), mcp.Description("Remote SSH hostname or IP address")),
+			mcp.WithNumber("port", mcp.Description("SSH port (default 22)")),
+			mcp.WithString("user", mcp.Required(), mcp.Description("SSH username")),
+			mcp.WithString("password", mcp.Description("SSH password")),
+			mcp.WithString("key_path", mcp.Description("Path to private key file")),
+			mcp.WithString("key_content", mcp.Description("Raw private key PEM string")),
+			mcp.WithString("passphrase", mcp.Description("Passphrase for encrypted private key")),
+			mcp.WithNumber("timeout_seconds", mcp.Description("Timeout in seconds (default 10)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			host, _ := req.RequireString("host")
+			user, _ := req.RequireString("user")
+
+			port := int(req.GetFloat("port", 22))
+			password := req.GetString("password", "")
+			keyPath := req.GetString("key_path", "")
+			keyContent := req.GetString("key_content", "")
+			passphrase := req.GetString("passphrase", "")
+			timeoutSec := req.GetFloat("timeout_seconds", 10)
+
+			sshMgr := NewSSHClientManager()
+			authOpts := SSHAuthOptions{
+				Password:   password,
+				KeyPath:    keyPath,
+				KeyContent: keyContent,
+				Passphrase: passphrase,
+			}
+
+			err := sshMgr.TestConnection(ctx, host, port, user, authOpts, time.Duration(timeoutSec)*time.Second)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("SSH connection test to %s:%d failed: %v", host, port, err)), nil
+			}
+
+			return mcp.NewToolResultText(fmt.Sprintf("Successfully connected to SSH host %s:%d as user '%s'.", host, port, user)), nil
+		},
+	)
 }
 
 func (w *MCPServerWrapper) registerTool(name string, description string, options []mcp.ToolOption, handler func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error)) {
