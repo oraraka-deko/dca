@@ -106,7 +106,12 @@ func InstallService(cfg utils.ServerConfig, configPath string) error {
 		return fmt.Errorf("unsupported OS for service installation: %s", runtime.GOOS)
 	}
 
-	// 3. Save configuration
+	// 3. Ensure SSL certificates are provisioned if HTTPS enabled
+	if err := utils.EnsureCertificates(&cfg, filepath.Dir(configPath)); err != nil {
+		fmt.Printf("Warning: SSL certificate provisioning: %v\n", err)
+	}
+
+	// 4. Save configuration
 	if err := cfg.SaveToFile(configPath); err != nil {
 		return fmt.Errorf("failed saving service config: %w", err)
 	}

@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
+	"dca/database"
 	"dca/utils"
 	tea "charm.land/bubbletea/v2"
 )
@@ -29,6 +31,7 @@ const (
 	stateUninstalling
 	stateMessage
 	stateRunningForeground
+	stateViewLogs
 )
 
 type actionResultMsg struct {
@@ -47,26 +50,32 @@ type startSrvResultMsg struct {
 	err     error
 }
 
+type logsResultMsg struct {
+	logs string
+	err  error
+}
+
 type tuiModel struct {
 	state        tuiState
 	menuIndex    int
 	inputBuffer  string
 	errorMessage string
 	infoMessage  string
+	logsRaw      string
 
 	// Service status
 	serviceStatusRaw string
 	serviceStatusTag string // "RUNNING", "STOPPED", "NOT INSTALLED", "UNKNOWN"
 
 	// Temporary configuration values
-	setupHost           string
-	setupPort           string
-	setupProtocol       string
-	setupCertType       string
-	setupDomain         string
-	setupBasePath       string
-	setupAuthMode       string
-	setupAllowedIPs     string
+	setupHost       string
+	setupPort       string
+	setupProtocol   string
+	setupCertType   string
+	setupDomain     string
+	setupBasePath   string
+	setupAuthMode   string
+	setupAllowedIPs string
 
 	// Choices indices for option selectors
 	protocolIndex int
@@ -80,7 +89,7 @@ type tuiModel struct {
 
 var protocolOptions = []string{"http", "https"}
 var certTypeOptions = []string{"selfsigned", "acme", "custom", "none"}
-var authModeOptions = []string{"open", "custom_path", "custom_path_ip", "ip_only"}
+var authModeOptions = []string{"open", "custom_path", "custom_path_ip", "ip_only", "token", "custom_path_token_ip"}
 
 func (m tuiModel) Init() tea.Cmd {
 	return checkStatusCmd()
@@ -91,7 +100,6 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		// Universal exit
 		if msg.String() == "ctrl+c" {
-			// Stop foreground server if running
 			if m.foregroundCancel != nil {
 				m.foregroundCancel()
 			}
@@ -101,7 +109,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.state {
 		case stateMenu:
 			return m.updateMenu(msg)
-		case stateStatus, stateMessage:
+		case stateStatus, stateMessage, stateViewLogs:
 			if msg.Key().Code == tea.KeyEnter || msg.Key().Code == tea.KeyEsc {
 				m.state = stateMenu
 				return m, checkStatusCmd()
@@ -137,6 +145,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.infoMessage = msg.info
 		}
 
+	case logsResultMsg:
+		m.logsRaw = msg.logs
+
 	case startSrvResultMsg:
 		if msg.err != nil {
 			m.state = stateMessage
@@ -157,19 +168,19 @@ func (m tuiModel) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyUp:
 		m.menuIndex--
 		if m.menuIndex < 0 {
-			m.menuIndex = 7
+			m.menuIndex = 8
 		}
 	case tea.KeyDown:
 		m.menuIndex++
-		if m.menuIndex > 7 {
+		if m.menuIndex > 8 {
 			m.menuIndex = 0
 		}
 	case tea.KeyEnter:
 		return m.handleMenuSelect()
 	default:
-		// Also allow key numbers 1-8
+		// Allow key numbers 1-9
 		s := msg.String()
-		if len(s) == 1 && s[0] >= '1' && s[0] <= '8' {
+		if len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
 			m.menuIndex = int(s[0] - '1')
 			return m.handleMenuSelect()
 		}
@@ -227,10 +238,14 @@ func (m tuiModel) handleMenuSelect() (tea.Model, tea.Cmd) {
 	case 5: // Interactive Setup
 		m.startSetupWizard()
 		return m, nil
-	case 6: // Uninstall Service
+	case 6: // View Server Logs & Task History
+		m.state = stateViewLogs
+		m.logsRaw = "Fetching logs from database..."
+		return m, fetchLogsCmd()
+	case 7: // Uninstall Service
 		m.state = stateUninstalling
 		return m, uninstallServiceCmd()
-	case 7: // Exit
+	case 8: // Exit
 		return m, tea.Quit
 	}
 	return m, nil
@@ -256,8 +271,9 @@ func (m tuiModel) updateSetupWizard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	} else {
 		switch msg.Key().Code {
 		case tea.KeyBackspace, tea.KeyDelete:
-			if len(m.inputBuffer) > 0 {
-				m.inputBuffer = m.inputBuffer[:len(m.inputBuffer)-1]
+			runes := []rune(m.inputBuffer)
+			if len(runes) > 0 {
+				m.inputBuffer = string(runes[:len(runes)-1])
 			}
 			return m, nil
 		case tea.KeySpace:
@@ -266,7 +282,9 @@ func (m tuiModel) updateSetupWizard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		default:
 			txt := msg.Key().Text
 			if txt != "" {
-				m.inputBuffer += txt
+				clean := strings.ReplaceAll(txt, "\r", "")
+				clean = strings.ReplaceAll(clean, "\n", "")
+				m.inputBuffer += clean
 				return m, nil
 			}
 		}
@@ -331,7 +349,7 @@ func (m tuiModel) updateSetupWizard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.setupBasePath = bp
-			if m.setupAuthMode == "custom_path_ip" || m.setupAuthMode == "ip_only" {
+			if strings.Contains(m.setupAuthMode, "ip") {
 				m.inputBuffer = m.setupAllowedIPs
 				m.state = stateSetupAllowedIPs
 			} else {
@@ -393,6 +411,8 @@ func (m tuiModel) updateConfirmScreen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			AuthMode:       utils.AuthMode(m.setupAuthMode),
 			CustomBasePath: m.setupBasePath,
 			AllowedIPs:     parseIPList(m.setupAllowedIPs),
+			DBType:         "sqlite",
+			DBConnString:   filepath.Join(filepath.Dir(GetDefaultConfigPath()), "mymcp.db"),
 		}
 
 		if cfg.CertType == utils.CertTypeSelfSigned {
@@ -456,6 +476,7 @@ func (m tuiModel) View() tea.View {
 			"Restart Background Service",
 			"Run Server (Foreground Mode)",
 			"Interactive Configuration & Setup",
+			"View Server Logs & Task History",
 			"Uninstall Background Service",
 			"Exit",
 		}
@@ -467,7 +488,7 @@ func (m tuiModel) View() tea.View {
 				sb.WriteString(fmt.Sprintf("    %d. %s\n", i+1, opt))
 			}
 		}
-		sb.WriteString("\n\x1b[90m(Use Arrow keys or 1-8 to select, Enter to run)\x1b[0m\n")
+		sb.WriteString("\n\x1b[90m(Use Arrow keys or 1-9 to select, Enter to run)\x1b[0m\n")
 
 	case stateStatus:
 		sb.WriteString(" \x1b[1;36m--- Service Status & Output ---\x1b[0m\n\n")
@@ -475,6 +496,15 @@ func (m tuiModel) View() tea.View {
 			sb.WriteString(m.serviceStatusRaw)
 		} else {
 			sb.WriteString("Fetching status...\n")
+		}
+		sb.WriteString("\n\n\x1b[90mPress Enter to return to main menu...\x1b[0m\n")
+
+	case stateViewLogs:
+		sb.WriteString(" \x1b[1;36m--- Server Logs & Task History ---\x1b[0m\n\n")
+		if m.logsRaw != "" {
+			sb.WriteString(m.logsRaw)
+		} else {
+			sb.WriteString("No logs found.\n")
 		}
 		sb.WriteString("\n\n\x1b[90mPress Enter to return to main menu...\x1b[0m\n")
 
@@ -597,10 +627,12 @@ func (m tuiModel) renderWizardStep(sb *strings.Builder) {
 
 	case stateSetupAuthMode:
 		sb.WriteString("  [Step 6 of 8] Authentication Mode:\n")
-		sb.WriteString("  open: No restrictions (not recommended for public VPS).\n")
-		sb.WriteString("  custom_path: Server requires secret subfolder path.\n")
+		sb.WriteString("  open: No restrictions.\n")
+		sb.WriteString("  custom_path: Requires secret subfolder path.\n")
 		sb.WriteString("  custom_path_ip: Subfolder path AND IP whitelist check.\n")
-		sb.WriteString("  ip_only: Restricts access only to specific client IP addresses.\n\n")
+		sb.WriteString("  ip_only: Restricts access only to specific client IP addresses.\n")
+		sb.WriteString("  token: Requires X-MCP-Auth-Token header.\n")
+		sb.WriteString("  custom_path_token_ip: Subfolder path, Auth token AND IP whitelist.\n\n")
 		sb.WriteString("  Auth Mode: ")
 		for i, opt := range authModeOptions {
 			if i == m.authModeIndex {
@@ -641,6 +673,52 @@ func checkStatusCmd() tea.Cmd {
 	return func() tea.Msg {
 		stat, _ := GetServiceStatus()
 		return statusResultMsg{status: stat}
+	}
+}
+
+func fetchLogsCmd() tea.Cmd {
+	return func() tea.Msg {
+		cPath := GetDefaultConfigPath()
+		cfg, err := utils.LoadServerConfig(cPath)
+		if err != nil {
+			defaultCfg := utils.DefaultServerConfig()
+			cfg = &defaultCfg
+		}
+		dbStore, err := database.NewStore(cfg.DBType, cfg.DBConnString)
+		if err != nil {
+			return logsResultMsg{logs: fmt.Sprintf("Failed opening database (%s): %v", cfg.DBType, err)}
+		}
+		defer dbStore.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		logs, err := dbStore.QueryLogs(ctx, database.LogFilter{Limit: 25})
+		if err != nil {
+			return logsResultMsg{logs: fmt.Sprintf("Failed querying logs: %v", err)}
+		}
+
+		var sb strings.Builder
+		sb.WriteString("=== Recent Server Logs ===\n")
+		if len(logs) == 0 {
+			sb.WriteString("No log entries found in database.\n")
+		} else {
+			for _, l := range logs {
+				sb.WriteString(fmt.Sprintf("[%s] [%s] [%s] %s\n",
+					l.Timestamp.Format("15:04:05"), l.Level, l.Component, l.Message))
+			}
+		}
+
+		tasks, err := dbStore.QueryTasks(ctx, database.TaskFilter{Limit: 10})
+		if err == nil && len(tasks) > 0 {
+			sb.WriteString("\n=== Recent Task Executions ===\n")
+			for _, t := range tasks {
+				sb.WriteString(fmt.Sprintf("[%s] %s (%s) - %s\n",
+					t.ID, t.Name, t.Status, t.Command))
+			}
+		}
+
+		return logsResultMsg{logs: sb.String()}
 	}
 }
 

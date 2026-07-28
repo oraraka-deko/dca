@@ -89,6 +89,10 @@ func main() {
 			fmt.Println("MyMCP Service uninstalled successfully.")
 			return
 
+		case "run", "foreground":
+			// Explicit foreground mode request, fall through to server loop
+			break
+
 		case "install":
 			if isTerminal() {
 				if err := installer.RunTUI(); err != nil {

@@ -16,6 +16,8 @@ import (
 	"github.com/gogf/gf/v2/net/ghttp"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+
+	"dca/database"
 )
 
 var windowsBuiltins = map[string]bool{
@@ -39,6 +41,7 @@ type MCPServerWrapper struct {
 	TimerChain     *TimerChainManager
 	Hook           *MultiHook
 	FileManager    *FileManager
+	Store          database.Store
 	gfServer       *ghttp.Server
 }
 
@@ -55,6 +58,14 @@ func NewMCPServerWrapper(cfg ServerConfig) *MCPServerWrapper {
 	vfsMgr := NewVFSSandboxManager()
 	fm, _ := NewFileManager("")
 
+	dbStore, err := database.NewStore(cfg.DBType, cfg.DBConnString)
+	if err != nil {
+		dbStore, _ = database.NewStore("sqlite", ":memory:")
+	}
+	if dbStore != nil {
+		tm.SetStore(dbStore)
+	}
+
 	mcpSrv := server.NewMCPServer("dca-mcp-server", "1.0.0")
 
 	wrapper := &MCPServerWrapper{
@@ -65,6 +76,7 @@ func NewMCPServerWrapper(cfg ServerConfig) *MCPServerWrapper {
 		TimerChain:     tcm,
 		Hook:           hook,
 		FileManager:    fm,
+		Store:          dbStore,
 	}
 
 	wrapper.RegisterAllTools()
@@ -1031,6 +1043,95 @@ func (w *MCPServerWrapper) RegisterAllTools() {
 			return mcp.NewToolResultText(fmt.Sprintf("Scheduled item [%s] cancelled successfully", id)), nil
 		},
 	)
+
+	// ==========================================
+	// 11. Database Logs & Task History Tools
+	// ==========================================
+	w.registerTool("query_server_logs", "Query and filter server logs from persistent database",
+		[]mcp.ToolOption{
+			mcp.WithString("level", mcp.Description("Log level filter (INFO, WARN, ERROR, DEBUG)")),
+			mcp.WithString("component", mcp.Description("Component filter")),
+			mcp.WithString("query", mcp.Description("Text search query")),
+			mcp.WithNumber("limit", mcp.Description("Max log entries to return (default 50)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if w.Store == nil {
+				return mcp.NewToolResultError("Database store not initialized"), nil
+			}
+			level := req.GetString("level", "")
+			component := req.GetString("component", "")
+			qStr := req.GetString("query", "")
+			limitVal := req.GetFloat("limit", 50)
+
+			logs, err := w.Store.QueryLogs(ctx, database.LogFilter{
+				Level:     level,
+				Component: component,
+				Query:     qStr,
+				Limit:     int(limitVal),
+			})
+			if err != nil {
+				return mcp.NewToolResultError("Failed querying logs: " + err.Error()), nil
+			}
+			data, _ := json.MarshalIndent(logs, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	w.registerTool("query_task_history", "Query background task execution history from database",
+		[]mcp.ToolOption{
+			mcp.WithString("status", mcp.Description("Filter by status (Pending, Running, Completed, Failed, Cancelled)")),
+			mcp.WithString("query", mcp.Description("Search in task name or command")),
+			mcp.WithNumber("limit", mcp.Description("Max tasks to return (default 50)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if w.Store == nil {
+				return mcp.NewToolResultError("Database store not initialized"), nil
+			}
+			st := req.GetString("status", "")
+			qStr := req.GetString("query", "")
+			limitVal := req.GetFloat("limit", 50)
+
+			tasks, err := w.Store.QueryTasks(ctx, database.TaskFilter{
+				Status: st,
+				Query:  qStr,
+				Limit:  int(limitVal),
+			})
+			if err != nil {
+				return mcp.NewToolResultError("Failed querying tasks: " + err.Error()), nil
+			}
+			data, _ := json.MarshalIndent(tasks, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
+
+	w.registerTool("run_persistent_command", "Run command in a persistent stateful shell session",
+		[]mcp.ToolOption{
+			mcp.WithString("session_id", mcp.Required(), mcp.Description("Unique session ID")),
+			mcp.WithString("command", mcp.Required(), mcp.Description("Command string to execute")),
+			mcp.WithString("shell", mcp.Description("Shell executable (e.g. bash, sh, pwsh, cmd.exe)")),
+			mcp.WithNumber("timeout_seconds", mcp.Description("Timeout duration in seconds (default 60)")),
+		},
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			sessID, _ := req.RequireString("session_id")
+			cmdStr, _ := req.RequireString("command")
+			shell := req.GetString("shell", "")
+			timeoutSec := req.GetFloat("timeout_seconds", 60)
+
+			sess, err := StartPersistentSession(sessID, shell)
+			if err != nil {
+				return mcp.NewToolResultError("Failed launching shell session: " + err.Error()), nil
+			}
+
+			fut := sess.ExecuteAsync(CommandOptions{
+				Command: cmdStr,
+				Timeout: time.Duration(timeoutSec) * time.Second,
+			})
+			res := <-fut
+
+			data, _ := json.MarshalIndent(res, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		},
+	)
 }
 
 func (w *MCPServerWrapper) registerTool(name string, description string, options []mcp.ToolOption, handler func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error)) {
@@ -1063,8 +1164,17 @@ func (w *MCPServerWrapper) StartServer(ctx context.Context) error {
 
 	s.BindHandler(basePath, ghttp.WrapH(httpSrv))
 
-	if w.Cfg.Protocol == "https" && w.Cfg.CertFile != "" && w.Cfg.KeyFile != "" {
-		s.EnableHTTPS(w.Cfg.CertFile, w.Cfg.KeyFile)
+	if w.Cfg.Protocol == "https" {
+		if err := EnsureCertificates(&w.Cfg, ""); err != nil {
+			return fmt.Errorf("failed provisioning TLS certificates: %w", err)
+		}
+		if w.Cfg.CertFile != "" && w.Cfg.KeyFile != "" {
+			s.EnableHTTPS(w.Cfg.CertFile, w.Cfg.KeyFile)
+		}
+	}
+
+	if w.Store != nil {
+		_ = w.Store.InsertLog(ctx, "INFO", "Server", fmt.Sprintf("MyMCP Server listening on %s://%s:%d%s", w.Cfg.Protocol, w.Cfg.Host, w.Cfg.Port, w.Cfg.CustomBasePath), "")
 	}
 
 	w.gfServer = s

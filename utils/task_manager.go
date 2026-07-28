@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"dca/database"
 )
 
 // TaskStatus represents the current state of a task in the queue.
@@ -32,6 +34,7 @@ type TaskSnapshot struct {
 	ID          string     `json:"id"`
 	Name        string     `json:"name"`
 	Status      TaskStatus `json:"status"`
+	Command     string     `json:"command,omitempty"`
 	Result      string     `json:"result"`
 	Error       string     `json:"error"`
 	Progress    float64    `json:"progress"`
@@ -46,6 +49,7 @@ type Task struct {
 	ID          string
 	Name        string
 	Status      TaskStatus
+	Command     string
 	Result      string
 	Error       string
 	Progress    float64
@@ -66,6 +70,7 @@ func (t *Task) Snapshot() TaskSnapshot {
 		ID:          t.ID,
 		Name:        t.Name,
 		Status:      t.Status,
+		Command:     t.Command,
 		Result:      t.Result,
 		Error:       t.Error,
 		Progress:    t.Progress,
@@ -88,13 +93,14 @@ func (t *Task) SetProgress(val float64) {
 	t.Progress = val
 }
 
-// TaskManager manages queued background tasks with controlled concurrency.
+// TaskManager manages queued background tasks with controlled concurrency and DB persistence.
 type TaskManager struct {
 	mu          sync.RWMutex
 	tasks       map[string]*Task
 	queue       chan *Task
 	concurrency int
 	hook        *MultiHook
+	db          database.Store
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -122,6 +128,13 @@ func (tm *TaskManager) SetHook(h *MultiHook) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.hook = h
+}
+
+// SetStore attaches a persistent database Store instance.
+func (tm *TaskManager) SetStore(db database.Store) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.db = db
 }
 
 // Start launches worker goroutines to process the queue.
@@ -194,36 +207,39 @@ func (tm *TaskManager) SubmitTask(name string, fn TaskFunc) (*Task, error) {
 
 // SubmitCommand enqueues an OS shell/binary command execution task.
 func (tm *TaskManager) SubmitCommand(name string, useShell bool, command string, args ...string) (*Task, error) {
+	fullCmd := command
+	if len(args) > 0 {
+		fullCmd += " " + strings.Join(args, " ")
+	}
+
 	fn := func(ctx context.Context) (string, error) {
 		var cmd *exec.Cmd
 		if useShell {
 			if runtime.GOOS == "windows" {
-				fullCmd := command
-				if len(args) > 0 {
-					var quotedArgs []string
-					for _, arg := range args {
-						if strings.Contains(arg, " ") || strings.Contains(arg, "\t") {
-							quotedArgs = append(quotedArgs, fmt.Sprintf("\"%s\"", arg))
-						} else {
-							quotedArgs = append(quotedArgs, arg)
-						}
-					}
-					if len(quotedArgs) > 0 {
-						fullCmd += " " + strings.Join(quotedArgs, " ")
+				var quotedArgs []string
+				for _, arg := range args {
+					if strings.Contains(arg, " ") || strings.Contains(arg, "\t") {
+						quotedArgs = append(quotedArgs, fmt.Sprintf("\"%s\"", arg))
+					} else {
+						quotedArgs = append(quotedArgs, arg)
 					}
 				}
-				cmd = exec.CommandContext(ctx, "cmd.exe", "/c", fullCmd)
+				cmdStr := command
+				if len(quotedArgs) > 0 {
+					cmdStr += " " + strings.Join(quotedArgs, " ")
+				}
+				cmd = exec.CommandContext(ctx, "cmd.exe", "/c", cmdStr)
 			} else {
-				fullCmd := command
-				if len(args) > 0 {
-					var quotedArgs []string
-					for _, arg := range args {
-						escaped := strings.ReplaceAll(arg, "'", "'\\''")
-						quotedArgs = append(quotedArgs, fmt.Sprintf("'%s'", escaped))
-					}
-					fullCmd += " " + strings.Join(quotedArgs, " ")
+				var quotedArgs []string
+				for _, arg := range args {
+					escaped := strings.ReplaceAll(arg, "'", "'\\''")
+					quotedArgs = append(quotedArgs, fmt.Sprintf("'%s'", escaped))
 				}
-				cmd = exec.CommandContext(ctx, "/bin/sh", "-c", fullCmd)
+				cmdStr := command
+				if len(quotedArgs) > 0 {
+					cmdStr += " " + strings.Join(quotedArgs, " ")
+				}
+				cmd = exec.CommandContext(ctx, "/bin/sh", "-c", cmdStr)
 			}
 		} else {
 			cmd = exec.CommandContext(ctx, command, args...)
@@ -231,7 +247,15 @@ func (tm *TaskManager) SubmitCommand(name string, useShell bool, command string,
 		out, err := cmd.CombinedOutput()
 		return string(out), err
 	}
-	return tm.SubmitTask(name, fn)
+
+	task, err := tm.SubmitTask(name, fn)
+	if err == nil && task != nil {
+		task.mu.Lock()
+		task.Command = fullCmd
+		task.mu.Unlock()
+		tm.notifyHook(task.Snapshot())
+	}
+	return task, err
 }
 
 // CancelTask cancels a task by ID if pending or running.
@@ -344,6 +368,7 @@ func (tm *TaskManager) worker() {
 			ID:          task.ID,
 			Name:        task.Name,
 			Status:      task.Status,
+			Command:     task.Command,
 			Result:      task.Result,
 			Error:       task.Error,
 			Progress:    task.Progress,
@@ -360,10 +385,30 @@ func (tm *TaskManager) worker() {
 func (tm *TaskManager) notifyHook(snap TaskSnapshot) {
 	tm.mu.RLock()
 	hook := tm.hook
+	db := tm.db
 	tm.mu.RUnlock()
 
 	if hook != nil {
 		hook.TriggerString(fmt.Sprintf("Task [%s] '%s' status: %s", snap.ID, snap.Name, snap.Status))
 		hook.TriggerInterface(snap)
+	}
+
+	if db != nil {
+		go func(rec database.TaskRecord) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = db.SaveTask(ctx, rec)
+		}(database.TaskRecord{
+			ID:          snap.ID,
+			Name:        snap.Name,
+			Status:      string(snap.Status),
+			Command:     snap.Command,
+			Result:      snap.Result,
+			Error:       snap.Error,
+			Progress:    snap.Progress,
+			CreatedAt:   snap.CreatedAt,
+			StartedAt:   snap.StartedAt,
+			CompletedAt: snap.CompletedAt,
+		})
 	}
 }

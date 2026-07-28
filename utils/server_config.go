@@ -12,10 +12,12 @@ import (
 type AuthMode string
 
 const (
-	AuthModeOpen         AuthMode = "open"
-	AuthModeCustomPath   AuthMode = "custom_path"
-	AuthModeCustomPathIP AuthMode = "custom_path_ip"
-	AuthModeIPOnly       AuthMode = "ip_only"
+	AuthModeOpen               AuthMode = "open"
+	AuthModeCustomPath         AuthMode = "custom_path"
+	AuthModeCustomPathIP       AuthMode = "custom_path_ip"
+	AuthModeIPOnly             AuthMode = "ip_only"
+	AuthModeToken              AuthMode = "token"
+	AuthModeCustomPathTokenIP AuthMode = "custom_path_token_ip"
 )
 
 type CertType string
@@ -27,7 +29,7 @@ const (
 	CertTypeCustom     CertType = "custom"
 )
 
-// ServerConfig holds the network, TLS, and authorization settings for the MCP server.
+// ServerConfig holds the network, TLS, authorization, and database settings for the MCP server.
 type ServerConfig struct {
 	Host           string   `json:"host"`
 	Port           int      `json:"port"`
@@ -39,6 +41,11 @@ type ServerConfig struct {
 	AuthMode       AuthMode `json:"auth_mode"`
 	CustomBasePath string   `json:"custom_base_path"`
 	AllowedIPs     []string `json:"allowed_ips"`
+	AuthToken      string   `json:"auth_token,omitempty"`
+
+	// Database fields
+	DBType       string `json:"db_type"`        // "sqlite" or "postgres"
+	DBConnString string `json:"db_conn_string"` // sqlite file path or postgres connection string
 }
 
 // DefaultServerConfig returns safe default server options.
@@ -52,6 +59,9 @@ func DefaultServerConfig() ServerConfig {
 		AuthMode:       AuthModeOpen,
 		CustomBasePath: "/mcp",
 		AllowedIPs:     []string{},
+		AuthToken:      "",
+		DBType:         "sqlite",
+		DBConnString:   "mymcp.db",
 	}
 }
 
@@ -78,13 +88,29 @@ func LoadServerConfig(filePath string) (*ServerConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
+	if cfg.DBType == "" {
+		cfg.DBType = "sqlite"
+	}
+	if cfg.DBConnString == "" {
+		cfg.DBConnString = "mymcp.db"
+	}
 	return &cfg, nil
 }
 
 // ValidateAuthRequest checks whether an incoming HTTP request satisfies the AuthMode rules.
 func (cfg *ServerConfig) ValidateAuthRequest(r *http.Request) bool {
-	// 1. IP Validation if IP mode active
-	needIPCheck := cfg.AuthMode == AuthModeIPOnly || cfg.AuthMode == AuthModeCustomPathIP
+	// 1. Token Check if Token mode active
+	needTokenCheck := cfg.AuthMode == AuthModeToken || cfg.AuthMode == AuthModeCustomPathTokenIP
+	if needTokenCheck {
+		tokenHeader := r.Header.Get("X-MCP-Auth-Token")
+		tokenQuery := r.URL.Query().Get("token")
+		if cfg.AuthToken != "" && tokenHeader != cfg.AuthToken && tokenQuery != cfg.AuthToken {
+			return false
+		}
+	}
+
+	// 2. IP Validation if IP mode active
+	needIPCheck := cfg.AuthMode == AuthModeIPOnly || cfg.AuthMode == AuthModeCustomPathIP || cfg.AuthMode == AuthModeCustomPathTokenIP
 	if needIPCheck {
 		clientIP := getClientIP(r)
 		if !cfg.isIPAllowed(clientIP) {
@@ -92,8 +118,8 @@ func (cfg *ServerConfig) ValidateAuthRequest(r *http.Request) bool {
 		}
 	}
 
-	// 2. Path Validation if Custom Path mode active
-	needPathCheck := cfg.AuthMode == AuthModeCustomPath || cfg.AuthMode == AuthModeCustomPathIP
+	// 3. Path Validation if Custom Path mode active
+	needPathCheck := cfg.AuthMode == AuthModeCustomPath || cfg.AuthMode == AuthModeCustomPathIP || cfg.AuthMode == AuthModeCustomPathTokenIP
 	if needPathCheck {
 		basePath := cfg.CustomBasePath
 		if !strings.HasPrefix(basePath, "/") {
