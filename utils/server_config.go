@@ -2,10 +2,12 @@ package utils
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -46,6 +48,15 @@ type ServerConfig struct {
 	// Database fields
 	DBType       string `json:"db_type"`        // "sqlite" or "postgres"
 	DBConnString string `json:"db_conn_string"` // sqlite file path or postgres connection string
+
+	// King and Worker fields
+	KingAddress string `json:"king_address,omitempty" yaml:"king_address,omitempty"`
+	PairCode    string `json:"pair_code,omitempty" yaml:"pair_code,omitempty"`
+	PairToken   string `json:"pair_token,omitempty" yaml:"pair_token,omitempty"`
+	NodeID      string `json:"node_id,omitempty" yaml:"node_id,omitempty"`
+	IngressPort int    `json:"ingress_port,omitempty" yaml:"ingress_port,omitempty"`
+	WorkerMode  bool   `json:"worker_mode,omitempty" yaml:"worker_mode,omitempty"`
+	KingMode    bool   `json:"king_mode,omitempty" yaml:"king_mode,omitempty"`
 }
 
 // DefaultServerConfig returns safe default server options.
@@ -62,6 +73,97 @@ func DefaultServerConfig() ServerConfig {
 		AuthToken:      "",
 		DBType:         "sqlite",
 		DBConnString:   "mymcp.db",
+		KingAddress:    "",
+		PairCode:       "",
+		PairToken:      "",
+		NodeID:         "",
+		IngressPort:    0,
+		WorkerMode:     false,
+		KingMode:       false,
+	}
+}
+
+// Validate checks the configuration for consistency and defaults King ingress port if needed.
+func (cfg *ServerConfig) Validate() error {
+	if cfg.KingMode && cfg.WorkerMode {
+		return fmt.Errorf("cannot operate in both KingMode and WorkerMode simultaneously")
+	}
+
+	if cfg.KingMode {
+		if cfg.IngressPort == 0 {
+			cfg.IngressPort = 9090
+		}
+		if cfg.IngressPort == cfg.Port {
+			return fmt.Errorf("king ingress port (%d) cannot be equal to server port (%d)", cfg.IngressPort, cfg.Port)
+		}
+		if cfg.IngressPort < 1 || cfg.IngressPort > 65535 {
+			return fmt.Errorf("invalid ingress port: %d", cfg.IngressPort)
+		}
+	}
+
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return fmt.Errorf("invalid server port: %d", cfg.Port)
+	}
+
+	return nil
+}
+
+// ApplyEnvOverrides overrides configuration fields with environment variables starting with DCA_.
+func (cfg *ServerConfig) ApplyEnvOverrides() {
+	if v := os.Getenv("DCA_HOST"); v != "" {
+		cfg.Host = v
+	}
+	if v := os.Getenv("DCA_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			cfg.Port = p
+		}
+	}
+	if v := os.Getenv("DCA_PROTOCOL"); v != "" {
+		cfg.Protocol = v
+	}
+	if v := os.Getenv("DCA_AUTH_MODE"); v != "" {
+		cfg.AuthMode = AuthMode(v)
+	}
+	if v := os.Getenv("DCA_AUTH_TOKEN"); v != "" {
+		cfg.AuthToken = v
+	}
+	if v := os.Getenv("DCA_CUSTOM_BASE_PATH"); v != "" {
+		cfg.CustomBasePath = v
+	}
+	if v := os.Getenv("DCA_DB_TYPE"); v != "" {
+		cfg.DBType = v
+	}
+	if v := os.Getenv("DCA_DB_CONN_STRING"); v != "" {
+		cfg.DBConnString = v
+	}
+
+	// King and Worker env overrides
+	if v := os.Getenv("DCA_KING_ADDRESS"); v != "" {
+		cfg.KingAddress = v
+	}
+	if v := os.Getenv("DCA_PAIR_CODE"); v != "" {
+		cfg.PairCode = v
+	}
+	if v := os.Getenv("DCA_PAIR_TOKEN"); v != "" {
+		cfg.PairToken = v
+	}
+	if v := os.Getenv("DCA_NODE_ID"); v != "" {
+		cfg.NodeID = v
+	}
+	if v := os.Getenv("DCA_INGRESS_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			cfg.IngressPort = p
+		}
+	}
+	if v := os.Getenv("DCA_WORKER_MODE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.WorkerMode = b
+		}
+	}
+	if v := os.Getenv("DCA_KING_MODE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.KingMode = b
+		}
 	}
 }
 
@@ -78,7 +180,7 @@ func (cfg *ServerConfig) SaveToFile(filePath string) error {
 	return os.WriteFile(filePath, data, 0644)
 }
 
-// LoadServerConfig loads ServerConfig from JSON file.
+// LoadServerConfig loads ServerConfig from JSON file, applies env overrides, and validates.
 func LoadServerConfig(filePath string) (*ServerConfig, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -93,6 +195,10 @@ func LoadServerConfig(filePath string) (*ServerConfig, error) {
 	}
 	if cfg.DBConnString == "" {
 		cfg.DBConnString = "mymcp.db"
+	}
+	cfg.ApplyEnvOverrides()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 	return &cfg, nil
 }
