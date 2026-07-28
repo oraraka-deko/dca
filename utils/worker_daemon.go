@@ -375,6 +375,8 @@ func (w *WorkerDaemon) handleFallbackRequest(req JSONRPCRequest) []byte {
 	resp.ID = req.ID
 
 	switch req.Method {
+	case "panic_test":
+		panic("Simulated panic in tool execution")
 	case "ping":
 		resp.Result = json.RawMessage(`"pong"`)
 	case "initialize":
